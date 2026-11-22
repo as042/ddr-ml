@@ -67,11 +67,11 @@ for name, (problem, old, new) in CASES.items():
     text = f"// Invalid test simfile for ddr-trainer's loader. {problem}\n" + GENERATED + valid.replace(old, new)
     (out / name).write_text(text, encoding="utf-8")
 
-# Saved as Shift-JIS, which some older simfiles use, instead of UTF-8.
+# Shift-JIS, which some older simfiles use
 text = "// Invalid test simfile for ddr-trainer's loader. It is Shift-JIS, not UTF-8.\n" + GENERATED
 (out / "not_utf8.sm").write_bytes((text + VALID.format(title="テスト")).encode("shift_jis"))
 
-# A song folder whose .sm file doesn't share the folder's name, so loading the folder finds nothing.
+# A song folder whose .sm file doesn't share its name
 folder = out / "Mismatched Folder"
 folder.mkdir(exist_ok=True)
 text = (

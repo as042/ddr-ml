@@ -1,41 +1,40 @@
-use std::{fs, io::{self, ErrorKind}, path::Path};
+use std::{fs, io::{self, ErrorKind}, path::{Path, PathBuf}};
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
 pub struct SimFile {
-    // Header. A tag the file leaves out loads as "" (or 0 for numbers), the same as an empty
-    // one such as `#BANNER:;`, which is how StepMania treats it too.
-    title: String,
-    artist: String,
+    // Header. Missing tags load as "" or 0, like empty ones (`#BANNER:;`), as in StepMania.
+    pub title: String,
+    pub artist: String,
     artist_translit: String,
     banner: String,
     background: String,
     cd_title: String,
     music: String,
-    /// Seconds between the start of the music and beat 0, negated: `#OFFSET:-0.125` means
-    /// beat 0 is 0.125 s into the music file.
+    /// Negated: `#OFFSET:-0.125` puts beat 0 at 0.125 s into the music.
     offset: f64,
     sample_start: f64,
     sample_length: f64,
-    bpms: Vec<BPMChange>,
-    /// Pauses in the scrolling, in the order the file lists them.
-    stops: Vec<Stop>,
+    pub bpms: Vec<BPMChange>,
+    /// In file order.
+    pub stops: Vec<Stop>,
     bg_stage: String,
 
     /// Note information for each chart
-    step_charts: Vec<StepChart>,
+    pub step_charts: Vec<StepChart>,
 }
 
 pub struct BPMChange {
-    /// Can be fractional (`64.5=300`), and StepMania's editor always writes decimals (`0.000=150.000`).
-    beat: f64,
-    bpm: f64,
+    /// Can be fractional (`64.5=300`).
+    pub beat: f64,
+    pub bpm: f64,
 }
 
 pub struct Stop {
-    /// Beat the arrows stop on. Can be fractional, like `BPMChange::beat`.
-    beat: f64,
-    /// How long they stay stopped.
-    seconds: f64,
+    /// Can be fractional.
+    pub beat: f64,
+    pub seconds: f64,
 }
 
 pub enum StepChart {
@@ -44,9 +43,9 @@ pub enum StepChart {
 }
 
 pub struct SingleChart {
-    difficulty: ChartDifficulty,
-    rating: f64,
-    measures: Vec<Measure>,
+    pub difficulty: ChartDifficulty,
+    pub rating: f64,
+    pub measures: Vec<Measure>,
 }
 
 /// Not yet implemented.
@@ -55,7 +54,7 @@ pub struct DoubleChart {
 
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChartDifficulty {
     Beginner,
     Easy,
@@ -65,10 +64,10 @@ pub enum ChartDifficulty {
 }
 
 pub struct Measure {
-    /// Always 4 in .sm files, which have no time signatures. The rows split these beats
-    /// evenly, so 16 rows means 16th notes.
-    num_beats: usize,
-    rows: Vec<[Note; 4]>,
+    /// Always 4 in .sm files (no time signatures). Rows split the beats evenly: 16 rows are
+    /// 16th notes.
+    pub num_beats: usize,
+    pub rows: Vec<[Note; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,51 +75,56 @@ pub enum Note {
     Empty,
     Tap,
     HoldStart,
-    /// Ends a hold or a roll: .sm files use the same tail (`3`) for both.
+    /// Ends a hold or a roll (.sm files use `3` for both).
     End,
-    /// Start of a roll, which ends at the next `End` in the same column.
     RollStart,
-    /// A mine (DDR's shock arrows), which the player must not step on.
+    /// DDR's shock arrows
     Mine,
+}
+
+/// `path` itself, or for a song folder, the file in it named after the folder.
+pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let mut file_path = None;
+    if path.as_ref().is_dir() {
+        let abs_dir = path.as_ref().canonicalize()?;
+        let dir_name = abs_dir.file_name().ok_or(io::Error::other("Could not parse file name"))?;
+
+        for entry in fs::read_dir(path)?.flatten() {
+            let entry_path = entry.path();
+
+            // Check that it's a file and compare its stem (name without extension) to the folder name
+            if entry_path.is_file() && entry_path.file_stem() == Some(dir_name) {
+                file_path = Some(entry_path);
+            }
+         }
+    }
+    else if path.as_ref().is_file() {
+        file_path = Some(path.as_ref().to_path_buf());
+    }
+    file_path.ok_or(io::Error::new(ErrorKind::NotFound, "Failed to determine path"))
 }
 
 impl SimFile {
     /// Load the entire contents of a simfile (.sm) into memory. Can select a file or the containing directory if they share the same name.
+    #[allow(dead_code)] // Only tests use it
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut file_path = None;
-        if path.as_ref().is_dir() {
-            let abs_dir = path.as_ref().canonicalize()?;
-            let dir_name = abs_dir.file_name().ok_or(io::Error::new(ErrorKind::Other, "Could not parse file name"))?;
+        SimFile::parse(&fs::read_to_string(simfile_path(path)?)?)
+    }
 
-            for entry in fs::read_dir(path)?.flatten() {
-                let entry_path = entry.path();
-
-                // Check that it's a file and compare its stem (name without extension) to the folder name
-                if entry_path.is_file() && entry_path.file_stem() == Some(dir_name) {
-                    file_path = Some(entry_path);
-                }
-             }
-        }
-        else if path.as_ref().is_file() {
-            file_path = Some(path.as_ref().to_path_buf());
-        }
-
-        let content = fs::read_to_string(&file_path.ok_or(io::Error::new(ErrorKind::NotFound, "Failed to determine path"))?)?;
-
+    pub fn parse(content: &str) -> io::Result<Self> {
         let mut sim = SimFile::default();
 
-        // A tag is `#NAME:value;`, and its value can span several lines (every chart's #NOTES
-        // does), so lines are collected in `pending` until a `;` closes the tag.
+        // A tag (`#NAME:value;`) can span lines, so they collect in `pending` until a `;`.
         let mut pending = String::new();
         for line in content.lines() {
-            // `//` starts a comment that runs to the end of the line.
+            // Strip `//` comments
             let line = line.split("//").next().unwrap_or_default();
             pending.push_str(line);
             pending.push('\n');
 
             while let Some(end) = pending.find(';') {
                 let tag: String = pending.drain(..=end).collect();
-                // Anything outside a tag (blank lines, stray text) is ignored.
+                // Skip text outside a tag
                 let Some(start) = tag.find('#') else { continue };
                 let tag = &tag[start + 1..end];
                 let (name, value) = tag.split_once(':').unwrap_or((tag, ""));
@@ -151,7 +155,7 @@ impl SimFile {
                     }
                     "BGSTAGE" => sim.bg_stage = value.to_string(),
                     "NOTES" => sim.step_charts.extend(parse_chart(value)?),
-                    _ => {} // Tags with no field in SimFile, such as #SUBTITLE or #DISPLAYBPM.
+                    _ => {} // Unused tags, such as #SUBTITLE
                 }
             }
         }
@@ -174,8 +178,7 @@ fn parse_number(what: &str, value: &str) -> io::Result<f64> {
     value.trim().parse().map_err(|_| invalid(format!("{what}: expected a number, got {value:?}")))
 }
 
-/// Parses comma-separated `beat=value` pairs, the format of `#BPMS` (`0=150,64.5=300`) and
-/// `#STOPS` (`32=0.5`). An empty value gives an empty list.
+/// Comma-separated `beat=value` pairs, as in `#BPMS` (`0=150,64.5=300`) and `#STOPS`.
 fn parse_beat_pairs(tag: &str, value: &str) -> io::Result<Vec<(f64, f64)>> {
     value
         .split(',')
@@ -189,11 +192,8 @@ fn parse_beat_pairs(tag: &str, value: &str) -> io::Result<Vec<(f64, f64)>> {
         .collect()
 }
 
-/// Parses the value of one `#NOTES` tag, which has six `:`-separated fields:
-/// `step type:description:difficulty:meter:groove radar values:note data`.
-///
-/// Returns `None` for charts `StepChart` has no place for: other step types (such as
-/// `pump-single` or `lights-cabinet`) and Edit charts.
+/// One `#NOTES` value: `step type:description:difficulty:meter:groove radar values:note data`.
+/// `None` for charts `StepChart` can't hold: other step types and Edit charts.
 fn parse_chart(value: &str) -> io::Result<Option<StepChart>> {
     let fields: Vec<&str> = value.splitn(6, ':').map(str::trim).collect();
     let &[step_type, _description, difficulty_name, meter, _radar, note_data] = fields.as_slice() else {
@@ -223,8 +223,7 @@ fn parse_chart(value: &str) -> io::Result<Option<StepChart>> {
     Ok(Some(chart))
 }
 
-/// Splits dance-single note data into measures, which are separated by `,` and hold one
-/// row per line.
+/// Measures are separated by `,` and hold one row per line.
 fn parse_measures(note_data: &str) -> Result<Vec<Measure>, String> {
     note_data
         .split(',')
@@ -243,7 +242,7 @@ fn parse_measures(note_data: &str) -> Result<Vec<Measure>, String> {
         .collect()
 }
 
-/// Parses one dance-single row, such as `1002`, into its four columns (left, down, up, right).
+/// One dance-single row, such as `1002`: left, down, up, right.
 fn parse_row(row: &str) -> Option<[Note; 4]> {
     let notes: Vec<Note> = row
         .chars()
@@ -265,9 +264,8 @@ mod tests {
     use super::*;
     use ChartDifficulty::*;
 
-    /// Loads a file or song folder from `test_resources/`. The valid files there are generated
-    /// by `test_resources/make_test_simfiles.py`, and each one's opening comment lists what it
-    /// covers.
+    /// Loads a file or song folder from `test_resources/`. The valid ones come from
+    /// `make_test_simfiles.py`.
     fn load(name: &str) -> SimFile {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources").join(name);
         SimFile::from_file(&path).unwrap_or_else(|e| panic!("failed to load {}: {e}", path.display()))
@@ -283,8 +281,7 @@ mod tests {
             .collect()
     }
 
-    /// A chart's notes written back out the way the .sm file has them, with rows separated
-    /// by spaces and measures by ", ".
+    /// The chart's notes in .sm notation, with rows separated by spaces and measures by ", ".
     fn notes_text(chart: &SingleChart) -> String {
         let row_text = |row: &[Note; 4]| -> String {
             row.iter()
@@ -395,9 +392,8 @@ mod tests {
         assert_eq!(notes_text(singles[0]), "1000 0100 0010 0001, 1111 0000");
     }
 
-    /// Every file in `test_resources/invalid/`, with part of the error it must fail with. Each
-    /// file is the same small valid simfile with one thing broken, which its first line describes.
-    /// They're generated by `test_resources/make_invalid_simfiles.py`.
+    /// (file in `test_resources/invalid/`, part of the error it must fail with). The files come
+    /// from `make_invalid_simfiles.py`, and each one's first line says what's broken.
     const INVALID_FILES: [(&str, &str); 11] = [
         ("bad_offset.sm", r#"#OFFSET: expected a number, got "abc""#),
         ("bpm_without_equals.sm", r#"#BPMS: expected beat=value, got "64.000""#),
@@ -425,7 +421,7 @@ mod tests {
             assert!(error.to_string().contains(expected), "{name}: expected an error containing {expected:?}, got {error:?}");
         }
 
-        // A new file in invalid/ needs an entry above, so it can't go untested.
+        // Every file in invalid/ must be listed above
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources/invalid");
         let mut files: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -441,8 +437,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_with_no_simfile() {
-        // The file in this folder is the valid base the invalid files are made from, so it loads
-        // by itself, but the folder doesn't, because the file's name doesn't match the folder's.
+        // The file loads by itself, but its folder doesn't: their names don't match.
         load("invalid/Mismatched Folder/other name.sm");
         for name in ["invalid/Mismatched Folder", "invalid/does not exist.sm"] {
             let error = load_error(name);

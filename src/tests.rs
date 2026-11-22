@@ -1,7 +1,5 @@
-//! Large-scale tests that train a full model end to end.
-//!
-//! Each one takes about a minute in release mode, so they're `#[ignore]`d and
-//! plain `cargo test` skips them. Run them with:
+//! Large-scale tests that train a full model end to end, about a minute each in release mode.
+//! They're `#[ignore]`d. Run them with:
 //!
 //! ```text
 //! cargo test --release -- --ignored --nocapture
@@ -17,9 +15,8 @@ use crate::{
     train::{OutputMetrics, TrainingConfig},
 };
 
-/// Every output must explain at least this fraction of its test-set variance.
-/// Data and initial weights are unseeded, so this leaves a wide margin below
-/// the ~0.999 these tests normally reach.
+/// Minimum test-set R² for every output. Data and weights are unseeded, so this leaves a wide
+/// margin below the usual ~0.999.
 const MIN_R2: f32 = 0.99;
 
 fn assert_fits(metrics: &[OutputMetrics], num_outputs: usize) {
@@ -34,17 +31,14 @@ fn assert_fits(metrics: &[OutputMetrics], num_outputs: usize) {
 fn one_input_one_output() {
     let device = DevicePreference::default().device();
 
-    // 10,000 random points in [-100, 100], one input and one target column each.
-    // They're generated in random order, so `fit`'s in-order split is already random.
     // y = 50*sin(x) + x + 3.5x^2
     let x = Tensor::<2>::random([10_000, 1], Distribution::Uniform(-100.0, 100.0), &device);
     let y = x.clone().sin().mul_scalar(50.0) + x.clone() + x.clone().powf_scalar(2.0) * 3.5;
-    let dataset = Dataset { x, y, train_ratio: 0.6, valid_ratio: 0.2 };
+    let dataset = Dataset { x, y };
 
-    // 1 input, 10 hidden layers narrowing from 100 to 10 wide, 1 output.
-    let model = ModelConfig::new(1, 10, 100, 10, 1).init(&device);
-    let (_, metrics) = model.fit(&dataset, &TrainingConfig::new());
-    assert_fits(&metrics, 1);
+    let model = ModelConfig::stepped(1, 10, 100, 10, 1).init(&device);
+    let (_, test) = model.fit(&dataset, &TrainingConfig::new().with_train_ratio(0.6).with_valid_ratio(0.2));
+    assert_fits(&test.metrics, 1);
 }
 
 #[test]
@@ -54,10 +48,10 @@ fn three_inputs_two_outputs_at_different_scales() {
     let n = 10_000;
     let col = |lo, hi| Tensor::<2>::random([n, 1], Distribution::Uniform(lo, hi), &device);
 
-    // 3 inputs on very different ranges.
+    // 3 inputs on very different ranges
     let (x0, x1, x2) = (col(-3.0, 3.0), col(0.0, 1.0), col(-100.0, 100.0));
 
-    // 2 outputs, each depending on several inputs, ~4 orders of magnitude apart in scale.
+    // 2 outputs, ~4 orders of magnitude apart in scale
     // y0 = sin(2*x0) + x1*x2/100            range ~[-2, 2]
     // y1 = 3.5*x2^2 + 50*x0*x1              range ~[-150, 35,150]
     let y0 = (x0.clone() * 2.0).sin() + x1.clone() * x2.clone() / 100.0;
@@ -65,10 +59,9 @@ fn three_inputs_two_outputs_at_different_scales() {
 
     let x = Tensor::cat(vec![x0, x1, x2], 1);
     let y = Tensor::cat(vec![y0, y1], 1);
-    let dataset = Dataset { x, y, train_ratio: 0.6, valid_ratio: 0.2 };
+    let dataset = Dataset { x, y };
 
-    // 3 inputs, 10 hidden layers narrowing from 100 to 10 wide, 2 outputs.
-    let model = ModelConfig::new(3, 10, 100, 10, 2).init(&device);
-    let (_, metrics) = model.fit(&dataset, &TrainingConfig::new());
-    assert_fits(&metrics, 2);
+    let model = ModelConfig::stepped(3, 10, 100, 10, 2).init(&device);
+    let (_, test) = model.fit(&dataset, &TrainingConfig::new().with_train_ratio(0.6).with_valid_ratio(0.2));
+    assert_fits(&test.metrics, 2);
 }
