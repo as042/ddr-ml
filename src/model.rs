@@ -1,4 +1,5 @@
 use burn::{
+    module::{Param, ParamId},
     nn::{Dropout, DropoutConfig, Linear, LinearConfig, Relu},
     prelude::*,
 };
@@ -60,7 +61,6 @@ impl ModelConfig {
         Self::new(std::iter::once(num_inputs).chain(hidden).chain([num_outputs]).collect())
     }
 
-    #[allow(dead_code)] // Only tests use it
     pub fn layer_sizes(&self) -> &[usize] {
         &self.layer_sizes
     }
@@ -120,6 +120,24 @@ impl Model {
     /// Number of output columns the model produces.
     pub fn num_outputs(&self) -> usize {
         self.linears.last().unwrap().weight.dims()[1]
+    }
+
+    /// A model that gives `x` what this one gives `x · weights + offsets`, by folding that map
+    /// into the first layer. `weights` is `[new_num_inputs, num_inputs]`, `offsets`
+    /// `[1, num_inputs]`.
+    pub fn with_input_map(mut self, weights: Tensor<2>, offsets: Tensor<2>) -> Self {
+        let weight = self.linears[0].weight.val();
+        let [_, width] = weight.dims();
+        let shift = offsets.matmul(weight.clone()).reshape([width]);
+        let bias = match &self.linears[0].bias {
+            Some(bias) => bias.val() + shift,
+            None => shift,
+        };
+        let mut first = LinearConfig::new(weights.dims()[0], width).init(&weight.device());
+        first.weight = Param::initialized(ParamId::new(), weights.matmul(weight));
+        first.bias = Some(Param::initialized(ParamId::new(), bias));
+        self.linears[0] = first;
+        self
     }
 
     pub fn forward<const D: usize>(&self, mut x: Tensor<D>) -> Tensor<D> {
@@ -201,6 +219,23 @@ mod tests {
 
         let no_dropout = ModelConfig::new(vec![3, 64, 1]).init(&device);
         assert_eq!(outputs(&no_dropout), outputs(&no_dropout));
+    }
+
+    #[test]
+    fn folds_an_input_map_into_the_first_layer() {
+        let device = DevicePreference::default().device();
+        let model = ModelConfig::new(vec![3, 5, 2]).init(&device).valid();
+        let device = model.linears[0].weight.val().device();
+        let weights = Tensor::<2>::from_data([[1.0, 0.5, -2.0], [0.0, 3.0, 1.0], [-1.0, 1.0, 0.25], [2.0, -0.5, 0.0]], &device);
+        let offsets = Tensor::<2>::from_data([[0.5, -1.0, 2.0]], &device);
+        let x = Tensor::<2>::from_data([[0.3, -1.0, 2.0, 0.7], [5.0, 0.0, -3.0, 1.5]], &device);
+
+        let expected = model.forward(x.clone().matmul(weights.clone()) + offsets.clone());
+        let mapped = model.with_input_map(weights, offsets);
+        assert_eq!(mapped.num_inputs(), 4);
+        assert_eq!(mapped.num_outputs(), 2);
+        let max_diff = (mapped.forward(x) - expected).abs().max().into_scalar::<f32>();
+        assert!(max_diff < 1e-5, "outputs differ by {max_diff}");
     }
 
     #[test]

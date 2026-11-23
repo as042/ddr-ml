@@ -8,11 +8,66 @@ use burn::{
     store::ModuleRecord,
     tensor::{Bytes, Distribution},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     dataset::{Dataset, shuffle},
     model::{Model, ModelConfig},
+    pca::Pca,
 };
+
+/// How [`Model::fit`] rescales each input column, with training-split statistics. Targets are
+/// always standardized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum InputScaling {
+    /// Subtract the mean, divide by the standard deviation
+    #[default]
+    Standardize,
+    /// Subtract the mean only. For columns whose relative scales carry meaning, such as PCA
+    /// components.
+    Center,
+    /// Use as given
+    Unscaled,
+}
+
+/// Whether [`ModelConfig::train`] trains on principal components of the inputs. The PCA is
+/// fitted on the training split, and the trained model still takes the original inputs.
+///
+/// [`InputScaling`] then applies to the components. `Standardize` gives the small ones the
+/// weight of the large ones, so `Center` usually suits them.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum InputPca {
+    #[default]
+    Off,
+    /// This many leading components
+    Components(usize),
+    /// The fewest leading components with this share of the variance, above 0 and at most 1
+    Variance(f64),
+}
+
+impl InputPca {
+    /// # Panics
+    ///
+    /// If off, or the count is 0, more than there are, or reaches a component without variance.
+    fn num_components(self, pca: &Pca) -> usize {
+        let count = match self {
+            InputPca::Off => panic!("the PCA is off"),
+            InputPca::Components(count) => count,
+            InputPca::Variance(fraction) => pca.components_for_variance(fraction),
+        };
+        assert!(
+            (1..=pca.components.len()).contains(&count),
+            "asked for {count} components, but there are 1 to {}",
+            pca.components.len()
+        );
+        // Standardizing a component that is only rounding error would blow it up
+        assert!(
+            pca.variances[count - 1] > 1e-9 * pca.variances[0],
+            "component {count} has no variance: the inputs have fewer independent directions"
+        );
+        count
+    }
+}
 
 /// Hyperparameters for [`Model::fit`].
 #[derive(Config, Debug)]
@@ -52,7 +107,12 @@ pub struct TrainingConfig {
     #[config(default = 42)]
     pub train_seed: u64,
 
-    /// Std of Gaussian noise added to standardized training inputs, fresh each batch. Never in
+    /// Only [`ModelConfig::train`] can apply it: it sizes the model's inputs to the components.
+    #[config(default = "InputPca::Off")]
+    pub input_pca: InputPca,
+    #[config(default = "InputScaling::Standardize")]
+    pub input_scaling: InputScaling,
+    /// Std of Gaussian noise added to the scaled training inputs, fresh each batch. Never in
     /// validation, train scoring or the saved model.
     #[config(default = 0.0)]
     pub input_noise: f64,
@@ -76,6 +136,16 @@ fn column_mean_std(t: &Tensor<2>) -> (Tensor<2>, Tensor<2>) {
     let std = var.sqrt();
     let constant = std.clone().equal_elem(0.0);
     (mean, std.mask_fill(constant, 1.0))
+}
+
+/// The mean and standard deviation that `scaling` subtracts and divides by, per input column.
+fn input_statistics(x_train: &Tensor<2>, scaling: InputScaling) -> (Tensor<2>, Tensor<2>) {
+    let (mean, std) = column_mean_std(x_train);
+    match scaling {
+        InputScaling::Standardize => (mean, std),
+        InputScaling::Center => (mean, std.ones_like()),
+        InputScaling::Unscaled => (mean.zeros_like(), std.ones_like()),
+    }
 }
 
 /// Accuracy of one output column on the test split, in original units.
@@ -105,7 +175,7 @@ pub struct TestResults {
 }
 
 /// Seeded random split of `0..num_rows` into (train, validation, test).
-fn split_rows(num_rows: usize, config: &TrainingConfig) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+pub fn split_rows(num_rows: usize, config: &TrainingConfig) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
     let n_train = (num_rows as f64 * config.train_ratio).round() as usize;
     let n_val = (num_rows as f64 * config.valid_ratio).round() as usize;
     assert!(n_train + n_val <= num_rows, "train_ratio + valid_ratio must not exceed 1");
@@ -143,11 +213,12 @@ fn select_rows(t: &Tensor<2>, rows: &[usize]) -> Tensor<2> {
 /// tracking, no dropout).
 #[derive(Module, Debug)]
 pub struct TrainedModel {
-    /// Best-validation weights, mapping standardized inputs to standardized outputs.
+    /// Best-validation weights, mapping scaled inputs to standardized outputs.
     /// [`TrainedModel::predict`] converts.
     pub model: Model,
-    /// Training-split statistics, each `[1, num_columns]`. `Param`s only so they're saved with
-    /// the module. Never trained.
+    /// What inputs and outputs are scaled by, each `[1, num_columns]`: training-split
+    /// statistics, or 0 and 1 where [`InputScaling`] skips a step. `Param`s only so they're saved
+    /// with the module. Never trained.
     pub x_mean: Param<Tensor<2>>,
     pub x_std: Param<Tensor<2>>,
     pub y_mean: Param<Tensor<2>>,
@@ -197,6 +268,32 @@ impl TrainedModel {
         Ok(skeleton.try_load_record(record)?.valid())
     }
 
+    /// For a model trained on the first `num_components` components of `pca`: the same model
+    /// taking the inputs the PCA was fitted on. The projection goes into the first layer.
+    fn with_pca_inputs(self, pca: &Pca, num_components: usize) -> Self {
+        let device = self.x_mean.val().device();
+        let width = pca.mean.len();
+        let row = |values: &[f64]| {
+            let values: Vec<f32> = values.iter().map(|&value| value as f32).collect();
+            Tensor::<2>::from_data(TensorData::new(values, [1, width]), &device)
+        };
+        // [width, num_components]: a component per column
+        let loadings: Vec<f32> =
+            (0..width).flat_map(|i| pca.components[..num_components].iter().map(move |component| component[i] as f32)).collect();
+        let loadings = Tensor::<2>::from_data(TensorData::new(loadings, [width, num_components]), &device);
+
+        // Scaled components = standardized inputs · weights + offsets
+        let weights = loadings / self.x_std.val();
+        let offsets = (self.x_mean.val() / self.x_std.val()).neg();
+        TrainedModel {
+            model: self.model.with_input_map(weights, offsets),
+            x_mean: stat_param(row(&pca.mean)),
+            x_std: stat_param(row(&pca.std)),
+            y_mean: self.y_mean,
+            y_std: self.y_std,
+        }
+    }
+
     /// Predicts targets in original units from raw inputs shaped `[num_rows, num_inputs]`.
     pub fn predict(&self, x: Tensor<2>) -> Tensor<2> {
         let x = (x.without_autodiff() - self.x_mean.val()) / self.x_std.val();
@@ -207,10 +304,38 @@ impl TrainedModel {
 impl ModelConfig {
     /// Seeds the device with `config.train_seed`, then builds a model and trains it with
     /// [`Model::fit`].
+    ///
+    /// With `config.input_pca` on, the model trains on the components and is then converted to
+    /// take `dataset`'s inputs, so it matches this config and saves like any other.
     pub fn train(&self, dataset: &Dataset, config: &TrainingConfig) -> (TrainedModel, TestResults) {
         let device = dataset.x.device();
+        if config.input_pca == InputPca::Off {
+            device.seed(config.train_seed);
+            return self.init(&device).fit(dataset, config);
+        }
+
+        let [num_rows, width] = dataset.x.dims();
+        assert_eq!(width, self.layer_sizes()[0], "dataset.x has {width} columns but the config takes {} inputs", self.layer_sizes()[0]);
+        let values = dataset.x.clone().into_data().try_to_vec::<f32>().unwrap();
+        let rows: Vec<Vec<f32>> = values.chunks(width).map(<[f32]>::to_vec).collect();
+        let (train_rows, _, _) = split_rows(num_rows, config);
+        let train: Vec<Vec<f32>> = train_rows.iter().map(|&row| rows[row].clone()).collect();
+        let pca = Pca::fit(&vec!["input"; width], &train);
+        let num_components = config.input_pca.num_components(&pca);
+        println!(
+            "PCA: training on {num_components} of {width} components, {:.1}% of the training split's variance",
+            pca.explained_variance_ratio()[..num_components].iter().sum::<f64>() * 100.0
+        );
+
+        let scores = pca.transform(&rows, num_components).concat();
+        let x = Tensor::from_data(TensorData::new(scores, [num_rows, num_components]), &device);
+        let components = Dataset { x, y: dataset.y.clone() };
+        let mut sizes = self.layer_sizes().to_vec();
+        sizes[0] = num_components;
+        let reduced = ModelConfig::new(sizes).with_dropout(self.dropout);
         device.seed(config.train_seed);
-        self.init(&device).fit(dataset, config)
+        let (trained, test) = reduced.init(&device).fit(&components, &config.clone().with_input_pca(InputPca::Off));
+        (trained.with_pca_inputs(&pca, num_components), test)
     }
 }
 
@@ -218,10 +343,14 @@ impl Model {
     /// Trains a copy of this model from its current weights, leaving `self` unchanged. Returns
     /// the weights with the best validation loss and their test-split results (also printed).
     ///
-    /// `dataset` must be on the autodiff device `self` was created on. Standardization uses
+    /// `dataset` must be on the autodiff device `self` was created on. Scaling uses
     /// training-split statistics only. The validation split drives learning-rate decay and
     /// early stopping.
     pub fn fit(&self, dataset: &Dataset, config: &TrainingConfig) -> (TrainedModel, TestResults) {
+        assert!(
+            config.input_pca == InputPca::Off,
+            "input_pca needs ModelConfig::train, which sizes the model's inputs to the components"
+        );
         // A wrong output width would broadcast against the targets and train without error.
         assert_eq!(
             dataset.x.dims()[1],
@@ -258,7 +387,7 @@ impl Model {
         let (y_train, y_val, y_test) = split(&dataset.y);
 
         // Normalization
-        let (x_mean, x_std) = column_mean_std(&x_train);
+        let (x_mean, x_std) = input_statistics(&x_train, config.input_scaling);
         let (y_mean, y_std) = column_mean_std(&y_train);
         let norm = |t: Tensor<2>, mean: &Tensor<2>, std: &Tensor<2>| (t - mean.clone()) / std.clone();
 
@@ -437,6 +566,127 @@ mod tests {
         let to_vec = |t: Tensor<2>| t.into_data().try_to_vec::<f32>().unwrap();
         assert_eq!(to_vec(mean), [2.0, 5.0, 0.0]);
         assert_eq!(to_vec(std), [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn scales_inputs_as_configured() {
+        let device = DevicePreference::default().device();
+        let x = Tensor::<2>::from_data([[1.0, 10.0, 7.0], [3.0, 30.0, 7.0]], &device);
+        let to_vec = |t: Tensor<2>| t.into_data().try_to_vec::<f32>().unwrap();
+        // (scaling, means, standard deviations)
+        let cases = [
+            (InputScaling::Standardize, [2.0, 20.0, 7.0], [1.0, 10.0, 1.0]),
+            (InputScaling::Center, [2.0, 20.0, 7.0], [1.0, 1.0, 1.0]),
+            (InputScaling::Unscaled, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+        ];
+        for (scaling, mean, std) in cases {
+            let (actual_mean, actual_std) = input_statistics(&x, scaling);
+            assert_eq!(to_vec(actual_mean), mean, "{scaling:?}");
+            assert_eq!(to_vec(actual_std), std, "{scaling:?}");
+        }
+        assert_eq!(TrainingConfig::new().input_scaling, InputScaling::Standardize);
+    }
+
+    /// The saved statistics are what `predict` scales by.
+    #[test]
+    fn fit_keeps_the_configured_input_scaling() {
+        let device = DevicePreference::default().device();
+        let inputs: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32, 100.0 * (i % 7) as f32]).collect();
+        let targets: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32]).collect();
+        let dataset = Dataset::from_rows(&inputs, &targets, &device);
+        let to_vec = |t: Tensor<2>| t.into_data().try_to_vec::<f32>().unwrap();
+        for scaling in [InputScaling::Standardize, InputScaling::Center, InputScaling::Unscaled] {
+            let config = TrainingConfig::new().with_batch_size(8).with_max_epochs(1).with_input_scaling(scaling);
+            let (trained, _) = ModelConfig::new(vec![2, 4, 1]).train(&dataset, &config);
+            let (mean, std) = (to_vec(trained.x_mean.val()), to_vec(trained.x_std.val()));
+            assert_eq!(std.iter().all(|&std| std == 1.0), scaling != InputScaling::Standardize, "{scaling:?}: {std:?}");
+            assert_eq!(mean.iter().all(|&mean| mean == 0.0), scaling == InputScaling::Unscaled, "{scaling:?}: {mean:?}");
+            assert!(to_vec(trained.y_std.val())[0] > 1.0, "targets are always standardized");
+        }
+    }
+
+    /// Columns 2 and 3 are combinations of 0 and 1, so there are 2 independent directions.
+    fn correlated_dataset(device: &Device) -> (Vec<Vec<f32>>, Dataset) {
+        let inputs: Vec<Vec<f32>> = (0..60)
+            .map(|i| {
+                let (a, b) = ((i % 7) as f32, (i % 11) as f32 * 10.0);
+                vec![a, b, 3.0 * a + 0.1 * b, 20.0 - a + 0.5 * b]
+            })
+            .collect();
+        let targets: Vec<Vec<f32>> = inputs.iter().map(|row| vec![2.0 * row[0] - 0.05 * row[1]]).collect();
+        let dataset = Dataset::from_rows(&inputs, &targets, device);
+        (inputs, dataset)
+    }
+
+    #[test]
+    fn picks_the_number_of_components() {
+        let device = DevicePreference::default().device();
+        let (inputs, _) = correlated_dataset(&device);
+        let pca = Pca::fit(&["a", "b", "c", "d"], &inputs);
+        assert_eq!(InputPca::Components(1).num_components(&pca), 1);
+        assert_eq!(InputPca::Components(2).num_components(&pca), 2);
+        assert_eq!(InputPca::Variance(1.0).num_components(&pca), 2);
+        assert_eq!(InputPca::Variance(0.01).num_components(&pca), 1);
+        assert_eq!(TrainingConfig::new().input_pca, InputPca::Off);
+    }
+
+    #[test]
+    #[should_panic(expected = "component 3 has no variance")]
+    fn rejects_components_without_variance() {
+        let (inputs, _) = correlated_dataset(&DevicePreference::default().device());
+        InputPca::Components(3).num_components(&Pca::fit(&["a", "b", "c", "d"], &inputs));
+    }
+
+    #[test]
+    #[should_panic(expected = "asked for 5 components")]
+    fn rejects_more_components_than_inputs() {
+        let (inputs, _) = correlated_dataset(&DevicePreference::default().device());
+        InputPca::Components(5).num_components(&Pca::fit(&["a", "b", "c", "d"], &inputs));
+    }
+
+    #[test]
+    #[should_panic(expected = "input_pca needs ModelConfig::train")]
+    fn fit_alone_rejects_a_pca() {
+        let device = DevicePreference::default().device();
+        let (_, dataset) = correlated_dataset(&device);
+        let config = TrainingConfig::new().with_batch_size(8).with_input_pca(InputPca::Components(2));
+        ModelConfig::new(vec![4, 8, 1]).init(&device).fit(&dataset, &config);
+    }
+
+    /// The test predictions come from the model on components. The returned model must give
+    /// the same from the original inputs, before and after saving.
+    #[test]
+    fn a_model_trained_on_components_takes_the_original_inputs() {
+        let device = DevicePreference::default().device();
+        let (inputs, dataset) = correlated_dataset(&device);
+        let model_config = ModelConfig::new(vec![4, 8, 1]);
+        for (pca, scaling) in [
+            (InputPca::Components(2), InputScaling::Center),
+            (InputPca::Components(1), InputScaling::Standardize),
+            (InputPca::Variance(0.999), InputScaling::Unscaled),
+        ] {
+            let config = TrainingConfig::new().with_batch_size(8).with_max_epochs(3).with_input_pca(pca).with_input_scaling(scaling);
+            let (trained, test) = model_config.train(&dataset, &config);
+            assert_eq!(trained.model.num_inputs(), 4, "{pca:?}");
+            assert!(!trained.predict(dataset.x.clone()).is_autodiff(), "{pca:?}");
+
+            let test_inputs: Vec<f32> = test.rows.iter().flat_map(|&row| inputs[row].clone()).collect();
+            let x = Tensor::<2>::from_data(TensorData::new(test_inputs, [test.rows.len(), 4]), &device);
+            let expected: Vec<f32> = test.predictions.iter().map(|row| row[0]).collect();
+            let check = |model: &TrainedModel, what: &str| {
+                let actual = model.predict(x.clone()).into_data().try_to_vec::<f32>().unwrap();
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert!((actual - expected).abs() < 1e-3, "{pca:?} {what}: predicted {actual}, not {expected}");
+                }
+            };
+            check(&trained, "trained");
+
+            let dir = std::env::temp_dir().join(format!("ddr-trainer-pca-model-{}-{:?}", std::process::id(), scaling));
+            trained.save(&model_config, &dir).unwrap();
+            let reloaded = TrainedModel::load(&dir, &device).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            check(&reloaded, "reloaded");
+        }
     }
 
     /// An untrained model with made-up statistics is enough: a field that failed to load would
