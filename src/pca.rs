@@ -142,7 +142,7 @@ fn standardize(row: &[f32], mean: &[f64], std: &[f64]) -> Vec<f64> {
 
 /// Eigenvalues of a symmetric matrix, largest first, with their unit eigenvectors. Cyclic
 /// Jacobi rotations.
-fn symmetric_eigen(mut a: Vec<Vec<f64>>) -> (Vec<f64>, Vec<Vec<f64>>) {
+pub(crate) fn symmetric_eigen(mut a: Vec<Vec<f64>>) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = a.len();
     // Eigenvectors in columns
     let mut v: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect()).collect();

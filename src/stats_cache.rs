@@ -19,10 +19,11 @@ use crate::sim_loader::{SimFile, simfile_path};
 
 /// The source files that decide a simfile's statistics, with their paths from `src/`. Any change
 /// to them, even to a comment, makes every cached entry out of date.
-const FINGERPRINTED: [(&str, &str); 4] = [
+const FINGERPRINTED: [(&str, &str); 5] = [
     ("sim_loader.rs", include_str!("sim_loader.rs")),
     ("chart_analyzer.rs", include_str!("chart_analyzer.rs")),
     ("chart_analyzer/footing.rs", include_str!("chart_analyzer/footing.rs")),
+    ("chart_analyzer/footing/patterns.rs", include_str!("chart_analyzer/footing/patterns.rs")),
     ("stats_cache.rs", include_str!("stats_cache.rs")),
 ];
 
@@ -307,8 +308,16 @@ mod tests {
         // Every analyzer file must be listed, each under the path it's included from.
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut expected: Vec<String> = ["sim_loader.rs", "chart_analyzer.rs", "stats_cache.rs"].map(String::from).into();
-        for entry in fs::read_dir(src.join("chart_analyzer")).unwrap() {
-            expected.push(format!("chart_analyzer/{}", entry.unwrap().file_name().to_string_lossy()));
+        let mut folders = vec![src.join("chart_analyzer")];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    expected.push(path.strip_prefix(&src).unwrap().to_string_lossy().into_owned());
+                }
+            }
         }
         expected.sort();
         let mut listed: Vec<String> = FINGERPRINTED.iter().map(|(path, _)| path.to_string()).collect();

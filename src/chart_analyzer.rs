@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::sim_loader::{BPMChange, ChartDifficulty, Measure, Note, SimFile, SingleChart, StepChart, Stop};
-use footing::{Start, simulate_chart, wrong_foot_penalty};
+pub use footing::patterns::Patterns;
+#[cfg(test)]
+pub use footing::{Cost, TEST_COSTS};
+pub use footing::{COSTS, Costs, Events, Foot, Solution};
 
 /// Difficulty statistics for a given chart. Used to train a model to predict chart rating.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,14 +50,26 @@ pub struct ChartStatistics {
     median_stream_len: f64,
     max_stream_len: f64,
 
-    // Footing, from the foot simulation (see `footing::Footing`)
-    num_crossovers: usize,
+    // Footing: the events of the foot simulation's cheapest footing (see `footing::Events`)
+    /// Repeated arrows stepped by the same foot. `num_jacks` is every repeated arrow.
+    num_same_foot_jacks: usize,
+    num_vertical_footswitches: usize,
+    num_sideswitches: usize,
+    num_horizontal_crossovers: usize,
+    num_vertical_crossovers: usize,
+    num_doublesteps: usize,
+    num_brackets: usize,
+    num_freeze_switches: usize,
     num_laterals: usize,
     num_half_spins: usize,
     num_full_spins: usize,
-    /// Extra crossovers, laterals and spins from starting each segment on the worse foot, per
-    /// note. Uses `SEGMENT_BREAK_SECONDS` segments, not the footing ones.
-    wrong_foot_penalty_per_note: f64,
+
+    // Patterns found on that footing (see `footing::patterns::Patterns`)
+    num_staircases: usize,
+    num_drills: usize,
+    num_drill_notes: usize,
+    num_gallops: usize,
+    num_triples: usize,
 
     // Rhythms and timings. A measure's subdivision is the finest its notes need (see `row_sub_div`).
     /// Distinct subdivisions among the measures
@@ -72,7 +87,7 @@ pub struct ChartStatistics {
 
 impl ChartStatistics {
     /// (name, value) pairs in field order: the model's input features.
-    pub fn features(&self) -> [(&'static str, f64); 29] {
+    pub fn features(&self) -> [(&'static str, f64); 40] {
         [
             ("chart_dur", self.chart_dur),
             ("chart_num_measures", self.chart_num_measures as f64),
@@ -93,11 +108,22 @@ impl ChartStatistics {
             ("mean_stream_len", self.mean_stream_len),
             ("median_stream_len", self.median_stream_len),
             ("max_stream_len", self.max_stream_len),
-            ("num_crossovers", self.num_crossovers as f64),
+            ("num_same_foot_jacks", self.num_same_foot_jacks as f64),
+            ("num_vertical_footswitches", self.num_vertical_footswitches as f64),
+            ("num_sideswitches", self.num_sideswitches as f64),
+            ("num_horizontal_crossovers", self.num_horizontal_crossovers as f64),
+            ("num_vertical_crossovers", self.num_vertical_crossovers as f64),
+            ("num_doublesteps", self.num_doublesteps as f64),
+            ("num_brackets", self.num_brackets as f64),
+            ("num_freeze_switches", self.num_freeze_switches as f64),
             ("num_laterals", self.num_laterals as f64),
             ("num_half_spins", self.num_half_spins as f64),
             ("num_full_spins", self.num_full_spins as f64),
-            ("wrong_foot_penalty_per_note", self.wrong_foot_penalty_per_note),
+            ("num_staircases", self.num_staircases as f64),
+            ("num_drills", self.num_drills as f64),
+            ("num_drill_notes", self.num_drill_notes as f64),
+            ("num_gallops", self.num_gallops as f64),
+            ("num_triples", self.num_triples as f64),
             ("num_sub_divs", self.num_sub_divs as f64),
             ("mode_sub_div", self.mode_sub_div as f64),
             ("num_adv_sub_divs", self.num_adv_sub_divs as f64),
@@ -112,7 +138,7 @@ impl StepChart {
     #[allow(dead_code)] // Not called yet
     pub fn analyze(&self, bpms: &[BPMChange], stops: &[Stop]) -> ChartStatistics {
         match self {
-            StepChart::DanceSingle(single_chart) => analyze_single_chart(single_chart, bpms, stops),
+            StepChart::DanceSingle(single_chart) => analyze_single_chart(single_chart, bpms, stops, &COSTS),
             StepChart::DanceDouble(_double_chart) => analyze_double_chart(),
         }
     }
@@ -133,14 +159,15 @@ pub fn analyze_singles(sim: &SimFile) -> Vec<AnalyzedChart> {
             StepChart::DanceSingle(single) => Some(AnalyzedChart {
                 difficulty: single.difficulty,
                 rating: single.rating,
-                stats: analyze_single_chart(single, &sim.bpms, &sim.stops),
+                stats: analyze_single_chart(single, &sim.bpms, &sim.stops, &COSTS),
             }),
             StepChart::DanceDouble(_) => None,
         })
         .collect()
 }
 
-fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop]) -> ChartStatistics {
+/// `costs`: the foot simulation's.
+fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs) -> ChartStatistics {
     let timing = Timing::new(bpms, stops);
     let mut stats = ChartStatistics::default();
     let span = count_notes_and_rhythms(&chart.measures, &mut stats);
@@ -154,8 +181,7 @@ fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop])
     let pattern_segments = segments(&notes, SEGMENT_BREAK_SECONDS);
     count_jacks(&pattern_segments, &mut stats);
     count_streams(&pattern_segments, &mut stats);
-    count_footing(&segments(&notes, FOOTING_BREAK_SECONDS), &mut stats);
-    count_wrong_foot_penalty(&pattern_segments, &mut stats);
+    count_footing(&segments(&notes, FOOTING_BREAK_SECONDS), costs, &mut stats);
     stats
 }
 
@@ -175,9 +201,6 @@ const ACTIVE_GAP_SECONDS: f64 = 1.0;
 /// Segment break for the foot simulation. Longer than `SEGMENT_BREAK_SECONDS`: players keep
 /// alternating feet through quarter notes.
 const FOOTING_BREAK_SECONDS: f64 = 0.5;
-
-/// Which foot starts each segment in the foot simulation.
-const START: Start = Start::Easier;
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
 /// 1000 BPM are 1.25 ms apart).
@@ -231,13 +254,21 @@ impl Timing {
 
 /// A note (see `ChartStatistics::num_notes`) and when it's hit.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct TimedNote {
+pub struct TimedNote {
     /// Seconds from beat 0
-    time: f64,
+    pub time: f64,
+    pub beat: f64,
     /// The whole row, including mines and hold ends
-    row: [Note; 4],
+    pub row: [Note; 4],
     /// Per arrow: when the hold or roll starting here ends
-    hold_ends: [Option<f64>; 4],
+    pub hold_ends: [Option<f64>; 4],
+}
+
+impl TimedNote {
+    /// Whether the note has `arrow` (0 to 3: Left, Down, Up, Right) to step on.
+    pub fn steps(&self, arrow: usize) -> bool {
+        steps_on(self.row[arrow])
+    }
 }
 
 /// The chart's notes in time order. Rows with only mines or hold ends aren't notes.
@@ -251,7 +282,8 @@ fn to_timed_notes(measures: &[Measure], timing: &Timing) -> Vec<TimedNote> {
             if row.iter().all(|&note| note == Note::Empty) {
                 continue;
             }
-            let time = timing.time_at(row_beat(measure_start, measure, r));
+            let beat = row_beat(measure_start, measure, r);
+            let time = timing.time_at(beat);
             for (arrow, &note) in row.iter().enumerate() {
                 if note == Note::End
                     && let Some(start) = holding[arrow].take()
@@ -265,7 +297,7 @@ fn to_timed_notes(measures: &[Measure], timing: &Timing) -> Vec<TimedNote> {
                         holding[arrow] = Some(notes.len());
                     }
                 }
-                notes.push(TimedNote { time, row: *row, hold_ends: [None; 4] });
+                notes.push(TimedNote { time, beat, row: *row, hold_ends: [None; 4] });
             }
         }
         measure_start += measure.num_beats;
@@ -343,6 +375,124 @@ fn segments(notes: &[TimedNote], break_seconds: f64) -> Vec<&[TimedNote]> {
     notes.chunk_by(|a, b| b.time - a.time <= break_seconds + TIME_EPSILON).collect()
 }
 
+/// Most branches the foot search keeps after a note (see `footing`).
+const MAX_FOOTING_BRANCHES: usize = 5000;
+
+/// A segment and its cheapest footing.
+pub struct FootedSegment {
+    pub notes: Vec<TimedNote>,
+    pub footing: Solution,
+}
+
+/// A chart's notes in segments, split as for the footing statistics.
+pub fn footing_segments(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop]) -> Vec<Vec<TimedNote>> {
+    let notes = to_timed_notes(&chart.measures, &Timing::new(bpms, stops));
+    segments(&notes, FOOTING_BREAK_SECONDS).into_iter().map(<[TimedNote]>::to_vec).collect()
+}
+
+/// The cheapest footing of a segment, from home.
+pub fn foot_segment(notes: &[TimedNote], costs: &Costs) -> Solution {
+    footing::solve(notes, costs, MAX_FOOTING_BRANCHES)
+}
+
+/// Each of a chart's `footing_segments`, footed.
+pub fn foot_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs) -> Vec<FootedSegment> {
+    footing_segments(chart, bpms, stops)
+        .into_iter()
+        .map(|notes| FootedSegment { footing: foot_segment(&notes, costs), notes })
+        .collect()
+}
+
+/// One segment from arrow letters, footed from home: `L`, `D`, `U` and `R` in either case, a
+/// jump in brackets (`[LR]`). `+` after an arrow starts a hold on it, which lasts until that
+/// arrow with a `-` after it (a row of its own, or in brackets with the notes it ends at), or to
+/// the end. A space is an empty row: a pause. The rows are `speed` times as close as the costs'
+/// reference gap.
+pub fn foot_arrows(arrows: &str, costs: &Costs, speed: f64) -> Result<FootedSegment, String> {
+    let mut rows: Vec<[Note; 4]> = Vec::new();
+    let mut jump: Option<[Note; 4]> = None;
+    // The arrow a `+` or `-` would mark
+    let mut last: Option<usize> = None;
+    for c in arrows.trim().chars() {
+        match c {
+            c if c.is_whitespace() => {
+                if jump.is_none() {
+                    rows.push([Note::Empty; 4]);
+                    last = None;
+                }
+            }
+            '[' if jump.is_none() => (jump, last) = (Some([Note::Empty; 4]), None),
+            ']' => match (jump.take(), last.take()) {
+                (Some(row), _) if row != [Note::Empty; 4] => rows.push(row),
+                (Some(_), _) => return Err("`[]` has no arrows in it".into()),
+                (None, _) => return Err("`]` without a `[`".into()),
+            },
+            '+' | '-' => {
+                let arrow = last.take().ok_or_else(|| format!("`{c}` doesn't follow an arrow"))?;
+                let row = match &mut jump {
+                    Some(row) => row,
+                    None => rows.last_mut().expect("the arrow's row"),
+                };
+                row[arrow] = if c == '+' { Note::HoldStart } else { Note::End };
+            }
+            _ => {
+                let arrow = "LDUR"
+                    .find(c.to_ascii_uppercase())
+                    .ok_or_else(|| format!("`{c}` isn't an arrow (L, D, U or R)"))?;
+                match &mut jump {
+                    Some(row) => row[arrow] = Note::Tap,
+                    None => {
+                        let mut row = [Note::Empty; 4];
+                        row[arrow] = Note::Tap;
+                        rows.push(row);
+                    }
+                }
+                last = Some(arrow);
+            }
+        }
+    }
+    if jump.is_some() {
+        return Err("`[` without a `]`".into());
+    }
+
+    let gap = costs.reference_gap / speed;
+    let mut notes: Vec<TimedNote> = Vec::new();
+    // Per arrow: index of the note that started its open hold
+    let mut holding: [Option<usize>; 4] = [None; 4];
+    let letter = |arrow: usize| &"LDUR"[arrow..=arrow];
+    for (index, row) in rows.iter().enumerate() {
+        let time = index as f64 * gap;
+        for (arrow, &note) in row.iter().enumerate() {
+            match (note, holding[arrow]) {
+                (Note::End, Some(start)) => (notes[start].hold_ends[arrow], holding[arrow]) = (Some(time), None),
+                (Note::End, None) => return Err(format!("`{}-` without a hold on it", letter(arrow))),
+                (Note::Empty, _) | (_, None) => {}
+                (_, Some(_)) => return Err(format!("`{}` is stepped while it's held", letter(arrow))),
+            }
+        }
+        if row.iter().any(|&note| steps_on(note)) {
+            for (arrow, &note) in row.iter().enumerate() {
+                if note == Note::HoldStart {
+                    holding[arrow] = Some(notes.len());
+                }
+            }
+            // Beats as for 16ths
+            notes.push(TimedNote { time, beat: index as f64 * 0.25, row: *row, hold_ends: [None; 4] });
+        }
+    }
+    let end = rows.len() as f64 * gap;
+    for (arrow, start) in holding.into_iter().enumerate() {
+        if let Some(start) = start {
+            notes[start].hold_ends[arrow] = Some(end);
+        }
+    }
+    if notes.is_empty() {
+        return Err("no arrows".into());
+    }
+    let footing = footing::solve(&notes, costs, MAX_FOOTING_BRANCHES);
+    Ok(FootedSegment { notes, footing })
+}
+
 fn count_jacks(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
     let mut per_second = Vec::new();
     for &segment in segments {
@@ -374,19 +524,29 @@ fn count_streams(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
     (stats.mean_stream_len, stats.median_stream_len, stats.max_stream_len) = mean_median_max(lengths);
 }
 
-fn count_footing(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
-    let footing = simulate_chart(segments, START);
-    stats.num_crossovers = footing.crossovers;
-    stats.num_laterals = footing.laterals;
-    stats.num_half_spins = footing.half_spins;
-    stats.num_full_spins = footing.full_spins;
-}
-
-fn count_wrong_foot_penalty(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
-    let notes: usize = segments.iter().map(|segment| segment.len()).sum();
-    if notes > 0 {
-        stats.wrong_foot_penalty_per_note = wrong_foot_penalty(segments) as f64 / notes as f64;
+fn count_footing(segments: &[&[TimedNote]], costs: &Costs, stats: &mut ChartStatistics) {
+    let (mut events, mut patterns) = (Events::default(), Patterns::default());
+    for segment in segments {
+        let footing = foot_segment(segment, costs);
+        events += footing.events;
+        patterns += footing.patterns;
     }
+    stats.num_same_foot_jacks = events.jacks;
+    stats.num_vertical_footswitches = events.vertical_footswitches;
+    stats.num_sideswitches = events.sideswitches;
+    stats.num_horizontal_crossovers = events.footing.horizontal_crossovers;
+    stats.num_vertical_crossovers = events.vertical_crossovers;
+    stats.num_doublesteps = events.doublesteps;
+    stats.num_brackets = events.brackets;
+    stats.num_freeze_switches = events.freeze_switches;
+    stats.num_laterals = events.footing.laterals;
+    stats.num_half_spins = events.footing.half_spins;
+    stats.num_full_spins = events.footing.full_spins;
+    stats.num_staircases = patterns.staircases;
+    stats.num_drills = patterns.drills;
+    stats.num_drill_notes = patterns.drill_notes;
+    stats.num_gallops = patterns.gallops;
+    stats.num_triples = patterns.triples;
 }
 
 fn shares_an_arrow(a: &TimedNote, b: &TimedNote) -> bool {
@@ -525,6 +685,8 @@ mod tests {
 
     use super::*;
     use crate::sim_loader::{ChartDifficulty, SimFile};
+
+    const COSTS: Costs = TEST_COSTS;
     use ChartDifficulty::*;
 
     /// Loads a file in `test_resources/`. The `*_stats.sm` fixtures come from
@@ -546,7 +708,7 @@ mod tests {
 
     fn stats(file: &str, difficulty: ChartDifficulty) -> ChartStatistics {
         let sim = load(file);
-        analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops)
+        analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops, &COSTS)
     }
 
     fn assert_close(actual: f64, expected: f64, what: &str) {
@@ -692,6 +854,66 @@ mod tests {
     }
 
     #[test]
+    fn foots_arrow_letters() {
+        let footed = foot_arrows("ld[U D]r", &COSTS, 1.0).unwrap();
+        let rows: Vec<[bool; 4]> = footed.notes.iter().map(|note| [0, 1, 2, 3].map(|arrow| note.steps(arrow))).collect();
+        assert_eq!(
+            rows,
+            [[true, false, false, false], [false, true, false, false], [false, true, true, false], [false, false, false, true]]
+        );
+        assert_eq!(footed.footing.steps.len(), 4);
+        // Evenly spaced, at speed 1
+        assert!(footed.notes.windows(2).all(|pair| pair[1].time - pair[0].time == COSTS.reference_gap));
+        let crossover = COSTS.horizontal_crossover.base + COSTS.horizontal_crossover.speed;
+        assert_eq!(foot_arrows("LDRDL", &COSTS, 1.0).unwrap().footing.cost, crossover);
+
+        // A space is a pause of one row. Twice the speed, half the gaps.
+        let times = |arrows: &str, speed: f64| -> Vec<f64> {
+            foot_arrows(arrows, &COSTS, speed).unwrap().notes.iter().map(|note| note.time).collect()
+        };
+        let gap = COSTS.reference_gap;
+        assert_eq!(times(" LD R  U ", 1.0), [0.0, gap, 3.0 * gap, 6.0 * gap]);
+        assert_eq!(times("LD R", 2.0), [0.0, gap / 2.0, 3.0 * gap / 2.0]);
+        let fast = foot_arrows("LDRDL", &COSTS, 2.0).unwrap().footing.cost;
+        assert_eq!(fast, COSTS.horizontal_crossover.base + COSTS.horizontal_crossover.speed * 2.0);
+        // Up's hold ends in the pause
+        let held = foot_arrows("U+L U-R", &COSTS, 1.0).unwrap();
+        assert_eq!(held.notes[0].hold_ends[2], Some(3.0 * gap));
+
+        // Down held under two notes, Left to the end, Up until the last jump
+        let held = foot_arrows("d+L+rD-[U+R][U-D]", &COSTS, 1.0);
+        let held = held.as_ref().map(|footed| footed.notes.iter().map(|note| note.hold_ends).collect::<Vec<_>>());
+        let gap = COSTS.reference_gap;
+        let expected = [
+            [None, Some(3.0 * gap), None, None],
+            [Some(6.0 * gap), None, None, None],
+            [None; 4],
+            [None, None, Some(5.0 * gap), None],
+            [None; 4],
+        ];
+        assert_eq!(held.as_deref(), Ok(&expected[..]));
+
+        for bad in ["", "  ", "LXR", "L[UD", "LD]", "L[]R", "[L[D]]", "+L", "L-", "L+L", "[LR]+", "L+-", "D+D-D-", "L +", "L+ L"] {
+            assert!(foot_arrows(bad, &COSTS, 1.0).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn foots_each_segment_of_a_chart() {
+        let sim = load("footing_stats.sm");
+        for chart in &sim.step_charts {
+            let StepChart::DanceSingle(chart) = chart else { continue };
+            let footed = foot_chart(chart, &sim.bpms, &sim.stops, &COSTS);
+            let notes: usize = footed.iter().map(|segment| segment.notes.len()).sum();
+            assert_eq!(notes, stats("footing_stats.sm", chart.difficulty).num_notes, "{:?}", chart.difficulty);
+            for segment in &footed {
+                assert_eq!(segment.footing.steps.len(), segment.notes.len());
+                assert!(segment.footing.exact);
+            }
+        }
+    }
+
+    #[test]
     fn splits_notes_into_segments() {
         let sim = load("pattern_stats.sm");
         let timing = Timing::new(&sim.bpms, &sim.stops);
@@ -766,31 +988,38 @@ mod tests {
     }
 
     #[test]
-    fn simulates_the_feet() {
-        // (difficulty, crossovers, laterals, half spins, full spins)
+    fn counts_the_footing() {
+        // (difficulty, [same-foot jacks, vertical footswitches, sideswitches, horizontal
+        // crossovers, vertical crossovers, doublesteps, brackets, freeze switches, laterals, half
+        // spins, full spins], [staircases, drills, drill notes, gallops, triples])
         let expected = [
-            (Beginner, 0, 0, 0, 0),
-            (Easy, 0, 0, 0, 0),
-            (Medium, 2, 0, 0, 0),
-            (Hard, 0, 0, 0, 0),
-            (Challenge, 1, 0, 0, 1),
+            (Beginner, [0; 11], [0; 5]),
+            // A staircase
+            (Easy, [0; 11], [1, 0, 0, 0, 0]),
+            // 2 doublesteps
+            (Medium, [0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0], [0; 5]),
+            (Hard, [0; 11], [0; 5]),
+            // 2 doublesteps and a bracket
+            (Challenge, [0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0], [0; 5]),
         ];
-        for (difficulty, crossovers, laterals, half_spins, full_spins) in expected {
+        for (difficulty, events, patterns) in expected {
             let s = stats("footing_stats.sm", difficulty);
-            assert_eq!(
-                (s.num_crossovers, s.num_laterals, s.num_half_spins, s.num_full_spins),
-                (crossovers, laterals, half_spins, full_spins),
-                "{difficulty:?}: (crossovers, laterals, half spins, full spins)"
-            );
-        }
-    }
-
-    #[test]
-    fn finds_the_wrong_foot_penalty() {
-        let expected = [(Beginner, 0.0), (Easy, 0.0), (Medium, 0.0), (Hard, 2.0 / 8.0), (Challenge, 4.0 / 16.0)];
-        for (difficulty, penalty) in expected {
-            let s = stats("footing_stats.sm", difficulty);
-            assert_close(s.wrong_foot_penalty_per_note, penalty, &format!("{difficulty:?} wrong-foot penalty"));
+            let counted = [
+                s.num_same_foot_jacks,
+                s.num_vertical_footswitches,
+                s.num_sideswitches,
+                s.num_horizontal_crossovers,
+                s.num_vertical_crossovers,
+                s.num_doublesteps,
+                s.num_brackets,
+                s.num_freeze_switches,
+                s.num_laterals,
+                s.num_half_spins,
+                s.num_full_spins,
+            ];
+            assert_eq!(counted, events, "{difficulty:?}: events");
+            let found = [s.num_staircases, s.num_drills, s.num_drill_notes, s.num_gallops, s.num_triples];
+            assert_eq!(found, patterns, "{difficulty:?}: patterns");
         }
     }
 

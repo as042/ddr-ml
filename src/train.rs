@@ -245,7 +245,6 @@ impl TrainedModel {
     }
 
     /// Loads a model saved with [`TrainedModel::save`], in validation mode.
-    #[allow(dead_code)] // Only tests use it
     pub fn load(dir: impl AsRef<Path>, device: &Device) -> Result<Self, Box<dyn Error>> {
         let dir = dir.as_ref();
         let config = ModelConfig::load(dir.join(CONFIG_FILE))?;

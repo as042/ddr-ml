@@ -82,7 +82,7 @@ pub enum Note {
     Mine,
 }
 
-/// `path` itself, or for a song folder, the file in it named after the folder.
+/// `path` itself, or for a song folder, the `.sm` file in it named after the folder.
 pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let mut file_path = None;
     if path.as_ref().is_dir() {
@@ -92,8 +92,9 @@ pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
         for entry in fs::read_dir(path)?.flatten() {
             let entry_path = entry.path();
 
-            // Check that it's a file and compare its stem (name without extension) to the folder name
-            if entry_path.is_file() && entry_path.file_stem() == Some(dir_name) {
+            // The folder's audio and images are named after it too
+            let is_sm = entry_path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("sm"));
+            if entry_path.is_file() && is_sm && entry_path.file_stem() == Some(dir_name) {
                 file_path = Some(entry_path);
             }
          }
@@ -106,7 +107,6 @@ pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 
 impl SimFile {
     /// Load the entire contents of a simfile (.sm) into memory. Can select a file or the containing directory if they share the same name.
-    #[allow(dead_code)] // Only tests use it
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         SimFile::parse(&fs::read_to_string(simfile_path(path)?)?)
     }
@@ -362,6 +362,24 @@ mod tests {
         assert_eq!(from_folder.title, from_file.title);
         let notes = |sim: &SimFile| singles(sim).into_iter().map(notes_text).collect::<Vec<_>>();
         assert_eq!(notes(&from_folder), notes(&from_file));
+    }
+
+    #[test]
+    fn loads_a_song_folder_with_its_audio_and_images() {
+        let folder = std::env::temp_dir().join(format!("ddr-trainer-song-folder-{}", std::process::id())).join("Song");
+        fs::create_dir_all(&folder).unwrap();
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources");
+        fs::copy(resources.join("chart_stats.sm"), folder.join("Song.SM")).unwrap();
+        // Named after the folder too, and not text
+        for other in ["Song.avi", "Song.ogg", "Song.png", "Song-jacket.png"] {
+            fs::write(folder.join(other), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        }
+        let loaded = SimFile::from_file(&folder);
+        let without = SimFile::from_file(folder.parent().unwrap());
+        fs::remove_dir_all(folder.parent().unwrap()).unwrap();
+        assert_eq!(loaded.unwrap().title, load("chart_stats.sm").title);
+        // No simfile named after that folder
+        assert_eq!(without.err().map(|e| e.kind()), Some(ErrorKind::NotFound));
     }
 
     #[test]
