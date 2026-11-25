@@ -53,10 +53,10 @@ pub struct Footing {
     pub horizontal_crossovers: usize,
     /// Steps into a lateral: left foot on Right, right foot on Left (facing away)
     pub laterals: usize,
-    /// Turns of 180 to 359 degrees in one direction that pass through facing away (facing left
-    /// round to facing right doesn't)
+    /// Turns of 180 to 359 degrees in one direction (see `Turning`) that pass through facing away
+    /// (facing left round to facing right doesn't)
     pub half_spins: usize,
-    /// Full 360 degree turns in one direction
+    /// Full 360 degree turns in one direction (see `Turning`)
     pub full_spins: usize,
 }
 
@@ -133,7 +133,11 @@ impl Stance {
     }
 }
 
-/// Tracks the player's facing through a segment, to count spins.
+/// Degrees a turn can go back from its furthest point and still be one turn.
+const TURN_BACK_DEGREES: i32 = 45;
+
+/// Tracks the player's facing through a segment, to count spins. A turn goes one way, give or take
+/// `TURN_BACK_DEGREES`.
 #[derive(Clone, Copy)]
 struct Turning {
     /// Facing, unwrapped (405 is a full clockwise turn plus 45), or None while unknown
@@ -142,11 +146,14 @@ struct Turning {
     turn_start: i32,
     /// 1 clockwise, -1 counterclockwise, 0 before the turn moves
     direction: i32,
+    /// Furthest angle the current turn has reached
+    peak: i32,
 }
 
 impl Turning {
     fn new(facing: Option<i32>) -> Self {
-        Turning { angle: facing, turn_start: facing.unwrap_or(0), direction: 0 }
+        let start = facing.unwrap_or(0);
+        Turning { angle: facing, turn_start: start, direction: 0, peak: start }
     }
 
     /// Current facing, wrapped.
@@ -170,17 +177,24 @@ impl Turning {
         if delta == 180 && wrap(angle) > 0 {
             delta = -180;
         }
-        if self.direction != 0 && delta.signum() != self.direction {
+        let angle = angle + delta;
+        self.angle = Some(angle);
+        if self.direction == 0 {
+            (self.direction, self.peak) = (delta.signum(), angle);
+        } else if (angle - self.peak) * self.direction > 0 {
+            self.peak = angle;
+        } else if (self.peak - angle) * self.direction > TURN_BACK_DEGREES {
+            // The turn ended at its peak. The next runs back from there.
+            let direction = self.direction;
             self.finish(footing);
+            (self.direction, self.peak) = (-direction, angle);
         }
-        self.direction = delta.signum();
-        self.angle = Some(angle + delta);
     }
 
-    /// Ends the current turn, counting any spins.
+    /// Ends the current turn at its peak, counting any spins.
     fn finish(&mut self, footing: &mut Footing) {
-        if let Some(angle) = self.angle {
-            let (low, high) = (angle.min(self.turn_start), angle.max(self.turn_start));
+        if self.angle.is_some() {
+            let (low, high) = (self.peak.min(self.turn_start), self.peak.max(self.turn_start));
             let turned = high - low;
             footing.full_spins += (turned / 360) as usize;
             // A half spin has to pass through facing away. `away` is the first such angle (180,
@@ -189,7 +203,7 @@ impl Turning {
             if turned % 360 >= 180 && away <= high {
                 footing.half_spins += 1;
             }
-            self.turn_start = angle;
+            self.turn_start = self.peak;
         }
         self.direction = 0;
     }
@@ -495,7 +509,8 @@ pub struct Solution {
     /// One per note
     pub steps: Vec<Step>,
     /// Each event, on the note whose step adds it, and each pattern, on its first note, in note
-    /// order. A spin is where its turn ends: the note that turns back, or the last.
+    /// order. A spin is where its turn ends: the note that turns back past `TURN_BACK_DEGREES`, or
+    /// the last.
     pub occurrences: Vec<Occurrence>,
     pub events: Events,
     /// The events' penalties, each at its speed
@@ -538,8 +553,8 @@ struct Key {
     /// Per arrow: bits of the hold end, or of -inf if it's over by the next note
     held_until: [u64; 4],
     last: Last,
-    /// (facing, start of the turn in progress, direction)
-    turn: Option<(i32, i32, i32)>,
+    /// (facing, start of the turn in progress, direction, peak)
+    turn: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -577,8 +592,9 @@ impl State {
             .map(|until| if until <= next_time + TIME_EPSILON { f64::NEG_INFINITY } else { until }.to_bits());
         let turn = self.turning.angle.map(|angle| {
             // Whole turns made before the turn in progress are already counted
-            let facing = wrap(angle);
-            (facing, self.turning.turn_start - (angle - facing), self.turning.direction)
+            let (facing, turning) = (wrap(angle), self.turning);
+            let shift = angle - facing;
+            (facing, turning.turn_start - shift, turning.direction, turning.peak - shift)
         });
         Key { on: self.on, held_until, last: self.last, turn }
     }
@@ -684,9 +700,10 @@ impl State {
         self.turning.face(facing, &mut self.events.footing);
         // Past two whole turns, count one now rather than at the turn's end: the same total, and
         // it keeps the turn in progress (part of `Key`) bounded
-        if let Some(angle) = self.turning.angle {
-            while (angle - self.turning.turn_start).abs() >= 720 {
-                self.turning.turn_start += 360 * (angle - self.turning.turn_start).signum();
+        if self.turning.angle.is_some() {
+            let peak = self.turning.peak;
+            while (peak - self.turning.turn_start).abs() >= 720 {
+                self.turning.turn_start += 360 * (peak - self.turning.turn_start).signum();
                 self.events.footing.full_spins += 1;
             }
         }
@@ -1139,6 +1156,38 @@ pub(super) mod tests {
         assert_eq!(solved("L D R U L D", &spinner), ("lrlrlr".into(), candled(2, events(0, 0, 1, 0, 0, 0, 1))));
     }
 
+    /// Unwrapped facing (see `Turning`) after each note of the cheapest footing.
+    fn facings(tokens: &str, costs: &Costs) -> Vec<i32> {
+        let notes = segment(tokens);
+        let mut state = State::home();
+        solve(&notes, costs, WIDTH)
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                (_, state) = uncosted_options(&notes, i, &state)
+                    .into_iter()
+                    .find(|(option, _)| option == step)
+                    .expect("a step is one of its note's options");
+                state.turning.angle.expect("both feet on arrows")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spins_through_uldr_only_when_spins_are_cheap() {
+        let tokens = "U L D R U L D R U L D R";
+        // Doublesteps, never facing away
+        assert_eq!(solved(tokens, &COSTS), ("rlrrllrrllrl".into(), candled(1, events(0, 0, 1, 4, 0, 0, 0))));
+        assert!(facings(tokens, &COSTS).iter().all(|facing| facing.abs() < 180));
+        // Cheap spins: alternates, round and round
+        let spinner = Costs { half_spin: Cost { base: 1.0, speed: 0.0 }, full_spin: Cost { base: 1.0, speed: 0.0 }, ..COSTS };
+        assert_eq!(solved(tokens, &spinner), ("lrlrlrlrlrlr".into(), candled(5, events(0, 0, 3, 0, 0, 1, 2))));
+        let turned = facings(tokens, &spinner);
+        assert!(turned.windows(2).all(|pair| pair[1] > pair[0]), "{turned:?}: one way round");
+        assert_eq!(turned.last(), Some(&1035));
+    }
+
     /// `tokens` with the notes `times` as fast.
     fn at_speed(tokens: &str, times: f64) -> Vec<TimedNote> {
         let faster = |note: TimedNote| TimedNote {
@@ -1208,18 +1257,20 @@ pub(super) mod tests {
         assert_eq!(feet(&solve(&segment("R L . . . U R U R"), &flat, WIDTH)), "rlrlrl");
     }
 
+    /// Facing each way in turn from the screen, then the turn ended: (full spins, half spins) and
+    /// the angle.
+    fn turned(facings: &[i32]) -> ((usize, usize), Option<i32>) {
+        let (mut turning, mut footing) = (Turning::new(Some(0)), Footing::default());
+        for &facing in facings {
+            turning.face(Some(facing), &mut footing);
+        }
+        let angle = turning.angle;
+        turning.finish(&mut footing);
+        ((footing.full_spins, footing.half_spins), angle)
+    }
+
     #[test]
     fn flips_back_toward_the_screen_whichever_way_it_has_turned() {
-        // Facing each way in turn, then the turn ended: (full spins, half spins) and the angle
-        let turned = |facings: &[i32]| {
-            let (mut turning, mut footing) = (Turning::new(Some(0)), Footing::default());
-            for &facing in facings {
-                turning.face(Some(facing), &mut footing);
-            }
-            let angle = turning.angle;
-            turning.finish(&mut footing);
-            ((footing.full_spins, footing.half_spins), angle)
-        };
         // Three quarters round clockwise, facing left. The flip to facing right goes on round
         // past the screen: one full spin, not a half spin there and another back.
         assert_eq!(turned(&[90, 180, -90, 90]), ((1, 0), Some(450)));
@@ -1229,6 +1280,15 @@ pub(super) mod tests {
         assert_eq!(turned(&[-90, 90]), ((0, 0), Some(90)));
         // Without a flip, three quarters round is a half spin
         assert_eq!(turned(&[90, 180, -90]), ((0, 1), Some(270)));
+    }
+
+    #[test]
+    fn turning_back_a_little_keeps_the_turn() {
+        // 45 back at 180: one turn of 405
+        assert_eq!(turned(&[90, 180, 135, -135, -45, 45]), ((1, 0), Some(405)));
+        assert_eq!(turned(&[-90, 180, -135, 135, 45, -45]), ((1, 0), Some(-405)));
+        // 90 back at 180, then 90 forward again: three turns
+        assert_eq!(turned(&[90, 180, 90, 180, -90, 0, 90]), ((1, 1), Some(450)));
     }
 
     #[test]
@@ -1536,7 +1596,7 @@ pub(super) mod tests {
         let pattern = "L D R D L U U R L D R U L D D R U L R D ".repeat(20);
         let solution = solve(&segment(&pattern), &COSTS, 1000);
         assert!(solution.exact);
-        assert!(solution.widest < 100);
+        assert!(solution.widest < 200);
     }
 
     #[test]
