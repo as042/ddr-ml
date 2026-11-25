@@ -128,24 +128,49 @@ pub fn analyze_single_chart(
     costs: &Costs,
     settings: &Settings,
 ) -> ChartStatistics {
+    analyze_chart(chart, bpms, stops, costs, settings).stats
+}
+
+/// A chart's statistics, and the segments they were counted from.
+pub struct ChartAnalysis {
+    pub stats: ChartStatistics,
+    /// In time order. Their notes are all the chart's.
+    pub segments: Vec<AnalyzedSegment>,
+}
+
+/// A segment (see `segments`) as the analyzer sees it.
+pub struct AnalyzedSegment {
+    pub notes: Vec<TimedNote>,
+    /// The cheapest footing, with its events and patterns
+    pub footing: Solution,
+    /// What the notes alone have (see `sequences`), in this segment's note indices
+    pub from_notes: Vec<technique::Occurrence>,
+}
+
+/// `analyze_single_chart`, keeping the footing and the techniques found.
+pub fn analyze_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs, settings: &Settings) -> ChartAnalysis {
     let timing = Timing::new(bpms, stops);
     let notes = to_timed_notes(&chart.measures, &timing);
     let mut stats = ChartStatistics::default();
     counts::count(&chart.measures, &notes, &timing, settings, &mut stats);
     radar::count(&chart.measures, &timing, &mut stats);
 
-    let (mut occurrences, mut note_costs, mut moves) = (Vec::new(), Vec::new(), Vec::new());
-    for segment in segments(&notes, settings.segment_break_seconds) {
-        occurrences.extend(sequences::find(segment, settings));
-        let footing = footing::solve(segment, costs, settings);
-        occurrences.extend(footing.occurrences);
-        note_costs.extend(footing.note_costs);
-        moves.extend(footing.moves);
-    }
+    let segments: Vec<AnalyzedSegment> = segments(&notes, settings.segment_break_seconds)
+        .into_iter()
+        .map(|segment| AnalyzedSegment {
+            notes: segment.to_vec(),
+            footing: footing::solve(segment, costs, settings),
+            from_notes: sequences::find(segment, settings),
+        })
+        .collect();
+    let occurrences: Vec<technique::Occurrence> =
+        segments.iter().flat_map(|segment| segment.from_notes.iter().chain(&segment.footing.occurrences)).copied().collect();
     stats.techniques = statistics::summarize(&occurrences);
+    let note_costs = segments.iter().flat_map(|segment| segment.footing.note_costs.iter().copied()).collect();
     counts::count_costs(&notes, note_costs, settings.window_seconds, &mut stats);
+    let moves: Vec<footing::moves::Move> = segments.iter().flat_map(|segment| segment.footing.moves.iter().copied()).collect();
     counts::count_feet(&moves, &mut stats);
-    stats
+    ChartAnalysis { stats, segments }
 }
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at

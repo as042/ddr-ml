@@ -15,18 +15,18 @@ use burn::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::chart_analyzer::{
-    COSTS, ChartStatistics, Costs, Foot, FootedSegment, SETTINGS, Settings, Source, Technique, analyze_single_chart,
-    analyze_singles, foot_arrows, foot_chart, footing_segments,
+    AnalyzedSegment, COSTS, ChartStatistics, Costs, Foot, FootedSegment, SETTINGS, Settings, Source, Technique,
+    analyze_chart, analyze_singles, foot_arrows, foot_chart, footing_segments,
 };
 #[cfg(test)]
-use crate::chart_analyzer::Cost;
+use crate::chart_analyzer::{Cost, analyze_single_chart};
 use crate::cma_es;
 use crate::cost_fit::{self, COLUMNS, SCORED, Sheet};
 use crate::dataset::Dataset;
 use crate::device::DevicePreference;
 use crate::model::ModelConfig;
 use crate::pca::Pca;
-use crate::sim_loader::{ChartDifficulty, SimFile, SingleChart, StepChart};
+use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, TrainedModel, TrainingConfig};
 
@@ -240,8 +240,8 @@ pub fn feet(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Runs the whole chart analyzer on one dance-single chart and prints the result as JSON (see
 /// `analysis_json`), for other programs. Takes every input the analyzer has: the simfile (`-`
 /// reads its text from stdin), the difficulty, and any of the costs and settings
-/// (`--jack-base 0.5` or `--jack-base=0.5`), the rest being `COSTS` and `SETTINGS`. With no
-/// arguments, lists them.
+/// (`--jack-base 0.5` or `--jack-base=0.5`), the rest being `COSTS` and `SETTINGS`. `--footing`
+/// adds the footing (see `footing_json`). With no arguments, lists them.
 pub fn analyze(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.is_empty() || matches!(args, [only] if only == "--help") {
         say!("{}", analyze_usage());
@@ -253,7 +253,7 @@ pub fn analyze(args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         SimFile::from_file(given.simfile).map_err(|e| format!("{}: {e}", given.simfile))?
     };
-    print_report(&(analysis_json(&sim, given.difficulty, &given.costs, &given.settings)? + "\n"))
+    print_report(&(analysis_json(&sim, given.difficulty, &given.costs, &given.settings, given.footing)? + "\n"))
 }
 
 /// A cost's or setting's option: `--jack-base` for "jack base".
@@ -264,8 +264,9 @@ fn option(name: &str) -> String {
 /// `analyze`'s arguments, and every cost and setting with its default.
 fn analyze_usage() -> String {
     let mut usage = String::from(
-        "usage: analyze <simfile> <difficulty> [--<cost or setting> <value>]...\n\n\
-         A simfile is a .sm file, its song folder, or - for its text on stdin.\n\ncosts (default):\n",
+        "usage: analyze <simfile> <difficulty> [--footing] [--<cost or setting> <value>]...\n\n\
+         A simfile is a .sm file, its song folder, or - for its text on stdin. --footing adds every\n\
+         note's footing and every technique found, by note.\n\ncosts (default):\n",
     );
     let mut costs = COSTS;
     for (name, value) in costs.parameters() {
@@ -285,10 +286,12 @@ struct AnalyzeArgs<'a> {
     difficulty: &'a str,
     costs: Costs,
     settings: Settings,
+    /// Whether to print the footing too
+    footing: bool,
 }
 
 fn analyze_args(args: &[String]) -> Result<AnalyzeArgs<'_>, String> {
-    let (mut costs, mut settings) = (COSTS, SETTINGS);
+    let (mut costs, mut settings, mut footing) = (COSTS, SETTINGS, false);
     let (mut given, mut positional) = (Vec::new(), Vec::new());
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -300,6 +303,16 @@ fn analyze_args(args: &[String]) -> Result<AnalyzeArgs<'_>, String> {
             Some((flag, value)) => (flag, Some(value)),
             None => (arg.as_str(), None),
         };
+        if flag == "--footing" {
+            if value.is_some() {
+                return Err("--footing takes no value".into());
+            }
+            if footing {
+                return Err("--footing is given twice".into());
+            }
+            footing = true;
+            continue;
+        }
         let cost = costs.parameters().into_iter().map(|(name, _)| name).find(|name| option(name) == flag);
         let setting = settings.values().into_iter().map(|(name, _)| name).find(|name| option(name) == flag);
         if cost.is_none() && setting.is_none() {
@@ -322,7 +335,7 @@ fn analyze_args(args: &[String]) -> Result<AnalyzeArgs<'_>, String> {
         set.map_err(|must| format!("{flag} {must}, not {value}"))?;
     }
     match positional[..] {
-        [simfile, difficulty] => Ok(AnalyzeArgs { simfile, difficulty, costs, settings }),
+        [simfile, difficulty] => Ok(AnalyzeArgs { simfile, difficulty, costs, settings, footing }),
         _ => Err(format!("analyze takes a simfile and a difficulty, then any costs and settings\n\n{}", analyze_usage())),
     }
 }
@@ -359,6 +372,135 @@ struct Analysis<'a> {
     settings: Settings,
     /// `ChartStatistics::features`, in order
     features: Named,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    footing: Option<FootingJson>,
+}
+
+/// `analyze --footing`'s footing. Notes are numbered over the whole chart, from 0, in time order.
+#[derive(Serialize)]
+struct FootingJson {
+    segments: Vec<SegmentJson>,
+    notes: Vec<NoteJson>,
+    /// Every technique found, in order of its first note
+    techniques: Vec<FoundJson>,
+}
+
+/// A run of notes footed on its own, from the feet at home (see `chart_analyzer::segments`).
+#[derive(Serialize)]
+struct SegmentJson {
+    first_note: usize,
+    notes: usize,
+    /// What its footing's events cost (see `Solution::cost`)
+    cost: f64,
+    /// False if the search dropped branches: the footing may not be the cheapest
+    exact: bool,
+}
+
+#[derive(Serialize)]
+struct NoteJson {
+    segment: usize,
+    /// Seconds from beat 0
+    time: f64,
+    /// Beats from the first measure's start
+    beat: f64,
+    /// The arrows stepped on, left to right
+    arrows: Vec<ArrowJson>,
+    /// Holds a foot takes over from the other foot here, in a freeze switch
+    regrabs: Vec<RegrabJson>,
+    /// What the events of its step cost (see `Solution::note_costs`)
+    cost: f64,
+}
+
+#[derive(Serialize)]
+struct ArrowJson {
+    /// left, down, up or right
+    arrow: &'static str,
+    /// tap, hold or roll
+    note: &'static str,
+    /// left or right, or null if neither foot can reach it (both are holding elsewhere)
+    foot: Option<&'static str>,
+    /// When a hold or roll ends, in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct RegrabJson {
+    arrow: &'static str,
+    foot: &'static str,
+}
+
+#[derive(Serialize)]
+struct FoundJson {
+    /// As in the statistics' names: jack, staircase, ...
+    technique: String,
+    /// The technique it is one kind of (full_crossover is a horizontal_crossover), if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind_of: Option<String>,
+    /// notes (found in the notes alone), footing_event or footing_pattern
+    source: &'static str,
+    first_note: usize,
+    /// How many it spans: 1 for an event
+    notes: usize,
+    /// Notes per second
+    speed: f64,
+}
+
+const ARROW_NAMES: [&str; 4] = ["left", "down", "up", "right"];
+
+fn foot_name(foot: Foot) -> &'static str {
+    match foot {
+        Foot::Left => "left",
+        Foot::Right => "right",
+    }
+}
+
+/// The footing of `segments` (a whole chart's), notes and techniques numbered over all of them.
+fn footing_json(segments: &[AnalyzedSegment]) -> FootingJson {
+    let mut json = FootingJson { segments: Vec::new(), notes: Vec::new(), techniques: Vec::new() };
+    let mut first = 0;
+    for (index, segment) in segments.iter().enumerate() {
+        let footing = &segment.footing;
+        json.segments.push(SegmentJson { first_note: first, notes: segment.notes.len(), cost: footing.cost, exact: footing.exact });
+        for ((note, step), &cost) in segment.notes.iter().zip(&footing.steps).zip(&footing.note_costs) {
+            let arrows = (0..4)
+                .filter(|&arrow| note.steps(arrow))
+                .map(|arrow| ArrowJson {
+                    arrow: ARROW_NAMES[arrow],
+                    note: match note.row[arrow] {
+                        Note::HoldStart => "hold",
+                        Note::RollStart => "roll",
+                        _ => "tap",
+                    },
+                    foot: step.foot(arrow).map(foot_name),
+                    end: note.hold_ends[arrow],
+                })
+                .collect();
+            let regrabs = (0..4)
+                .filter_map(|arrow| step.regrabber(arrow).map(|foot| RegrabJson { arrow: ARROW_NAMES[arrow], foot: foot_name(foot) }))
+                .collect();
+            json.notes.push(NoteJson { segment: index, time: note.time, beat: note.beat, arrows, regrabs, cost });
+        }
+        let mut found: Vec<_> = segment.from_notes.iter().chain(&footing.occurrences).collect();
+        found.sort_by_key(|occurrence| occurrence.note);
+        json.techniques.extend(found.into_iter().map(|occurrence| {
+            let technique = occurrence.technique;
+            FoundJson {
+                technique: technique.key(),
+                kind_of: Technique::ALL.into_iter().find(|parent| parent.kinds().contains(&technique)).map(Technique::key),
+                source: match technique.source() {
+                    Source::Notes => "notes",
+                    Source::FootingEvent => "footing_event",
+                    Source::FootingPattern => "footing_pattern",
+                },
+                first_note: first + occurrence.note,
+                notes: occurrence.notes,
+                speed: occurrence.speed,
+            }
+        }));
+        first += segment.notes.len();
+    }
+    json
 }
 
 /// (name, value) pairs: a JSON object, in their order. A value that isn't finite is null.
@@ -376,8 +518,8 @@ impl Serialize for Named {
 }
 
 /// `sim`'s dance-single chart of `difficulty` (any case), analyzed with `costs` and `settings`, as
-/// JSON.
-fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Settings) -> Result<String, String> {
+/// JSON. With `footing`, its footing too.
+fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Settings, footing: bool) -> Result<String, String> {
     let singles: Vec<&SingleChart> = sim
         .step_charts
         .iter()
@@ -397,7 +539,7 @@ fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Sett
         }
         _ => return Err(format!("{} has {} {difficulty} charts", sim.title, matching.len())),
     };
-    let stats = analyze_single_chart(chart, &sim.bpms, &sim.stops, costs, settings);
+    let analysis = analyze_chart(chart, &sim.bpms, &sim.stops, costs, settings);
     let mut costs = *costs;
     let analysis = Analysis {
         title: &sim.title,
@@ -407,7 +549,8 @@ fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Sett
         analyzer: format!("{:016x}", analyzer_fingerprint()),
         costs: Named(costs.parameters().iter().map(|(name, value)| (name.replace(' ', "_"), **value)).collect()),
         settings: *settings,
-        features: Named(stats.features()),
+        features: Named(analysis.stats.features()),
+        footing: footing.then(|| footing_json(&analysis.segments)),
     };
     serde_json::to_string_pretty(&analysis).map_err(|e| e.to_string())
 }
@@ -1159,10 +1302,11 @@ mod tests {
             "90",
             "--doublestep-speed",
             "-1",
+            "--footing",
             "--window-seconds=2.5",
         ]);
         let given = analyze_args(&args).unwrap();
-        assert_eq!((given.simfile, given.difficulty), ("song.sm", "hard"));
+        assert_eq!((given.simfile, given.difficulty, given.footing), ("song.sm", "hard", true));
         let mut expected = crate::chart_analyzer::COSTS;
         (expected.jack.base, expected.max_speed, expected.doublestep.speed) = (0.5, 3.0, -1.0);
         assert_eq!(cost_values(given.costs), cost_values(expected));
@@ -1172,6 +1316,9 @@ mod tests {
         let defaults = analyze_args(&stdin).unwrap();
         assert_eq!(cost_values(defaults.costs), cost_values(crate::chart_analyzer::COSTS));
         assert_eq!(defaults.settings, SETTINGS);
+        assert!(!defaults.footing);
+        // A flag: it takes no value
+        assert_eq!(analyze_args(&strings(&["song.sm", "--footing", "hard"])).unwrap().difficulty, "hard");
         // Every cost and setting has an option
         let mut costs = crate::chart_analyzer::COSTS;
         let names = costs.parameters().map(|(name, _)| name).into_iter().chain(SETTINGS.values().map(|(name, _)| name));
@@ -1194,6 +1341,8 @@ mod tests {
             (&["song.sm", "hard", "--max-footing-branches", "0"], "--max-footing-branches must be a whole number, 1 or more, not 0"),
             (&["song.sm", "hard", "--min-drill-notes=2.5"], "--min-drill-notes must be a whole number, 2 or more, not 2.5"),
             (&["song.sm", "hard", "--window-seconds", "0"], "--window-seconds must be more than 0, not 0"),
+            (&["song.sm", "hard", "--footing", "--footing"], "--footing is given twice"),
+            (&["song.sm", "hard", "--footing=yes"], "--footing takes no value"),
         ];
         for (args, error) in refused {
             let message = analyze_args(&strings(args)).unwrap_err();
@@ -1225,11 +1374,12 @@ mod tests {
         };
         let other_settings = Settings { window_seconds: 2.0, min_stream_notes: 3, max_footing_branches: 7, ..SETTINGS };
         for (costs, settings) in [(COSTS, SETTINGS), (doubled, other_settings)] {
-            let text = analysis_json(&sim, "cHaLlEnGe", &costs, &settings).unwrap();
+            let text = analysis_json(&sim, "cHaLlEnGe", &costs, &settings, false).unwrap();
             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!((json["title"].as_str(), json["difficulty"].as_str()), (Some(sim.title.as_str()), Some("Challenge")));
             assert_eq!(json["rating"].as_f64(), Some(challenge.rating));
             assert_eq!(json["analyzer"].as_str(), Some(format!("{:016x}", analyzer_fingerprint()).as_str()));
+            assert!(json.get("footing").is_none(), "only with --footing");
             let given: Vec<f64> = json["costs"].as_object().unwrap().values().map(|value| value.as_f64().unwrap()).collect();
             let mut sorted = costs;
             let mut by_name: Vec<(String, f64)> = sorted.parameters().iter().map(|(name, value)| (name.replace(' ', "_"), **value)).collect();
@@ -1257,14 +1407,82 @@ mod tests {
         }
         // The costs reach the footing: every penalty doubled, the same footing at twice the cost
         let cost_per_note = |costs: &Costs| {
-            let json: serde_json::Value = serde_json::from_str(&analysis_json(&sim, "challenge", costs, &SETTINGS).unwrap()).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&analysis_json(&sim, "challenge", costs, &SETTINGS, false).unwrap()).unwrap();
             json["features"]["mean_cost_per_note"].as_f64().unwrap()
         };
         let (single, double) = (cost_per_note(&COSTS), cost_per_note(&doubled));
         assert!(single > 0.0 && (double - 2.0 * single).abs() < 1e-3, "{single} doubled is {double}");
 
-        let none = analysis_json(&sim, "edit", &COSTS, &SETTINGS).unwrap_err();
+        let none = analysis_json(&sim, "edit", &COSTS, &SETTINGS, false).unwrap_err();
         assert!(none.contains("has no edit chart (it has Beginner, Easy, Medium, Hard, Challenge)"), "{none}");
+    }
+
+    #[test]
+    fn prints_the_footing_with_every_technique() {
+        let sim = SimFile::from_file("test_resources/footing_stats.sm").unwrap();
+        let text = analysis_json(&sim, "challenge", &COSTS, &SETTINGS, true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let footing = &json["footing"];
+        let number = |value: &serde_json::Value| value.as_u64().unwrap() as usize;
+        // The fixture's segments: 6, 4 and 6 notes
+        let segments = footing["segments"].as_array().unwrap();
+        let spans: Vec<(usize, usize)> = segments.iter().map(|segment| (number(&segment["first_note"]), number(&segment["notes"]))).collect();
+        assert_eq!(spans, [(0, 6), (6, 4), (10, 6)]);
+        assert!(segments.iter().all(|segment| segment["exact"] == true));
+        let notes = footing["notes"].as_array().unwrap();
+        assert_eq!(Some(notes.len() as f64), json["features"]["num_notes"].as_f64());
+
+        // Each note footed as the analyzer foots it
+        let challenge = sim
+            .step_charts
+            .iter()
+            .find_map(|chart| match chart {
+                StepChart::DanceSingle(single) if single.difficulty == ChartDifficulty::Challenge => Some(single),
+                _ => None,
+            })
+            .unwrap();
+        let analysis = analyze_chart(challenge, &sim.bpms, &sim.stops, &COSTS, &SETTINGS);
+        let footed = analysis
+            .segments
+            .iter()
+            .enumerate()
+            .flat_map(|(index, segment)| segment.notes.iter().zip(&segment.footing.steps).map(move |(note, step)| (index, note, step)));
+        assert_eq!(footed.clone().count(), notes.len());
+        for ((segment, note, step), json) in footed.zip(notes) {
+            assert_eq!((number(&json["segment"]), json["time"].as_f64(), json["beat"].as_f64()), (segment, Some(note.time), Some(note.beat)));
+            let arrows = json["arrows"].as_array().unwrap();
+            let feet: Vec<(&str, Option<&str>)> = arrows.iter().map(|arrow| (arrow["arrow"].as_str().unwrap(), arrow["foot"].as_str())).collect();
+            let expected: Vec<(&str, Option<&str>)> =
+                (0..4).filter(|&arrow| note.steps(arrow)).map(|arrow| (ARROW_NAMES[arrow], step.foot(arrow).map(foot_name))).collect();
+            assert_eq!(feet, expected, "note at {}", note.time);
+            // A hold or roll says when it ends, a tap doesn't
+            for arrow in arrows {
+                let held = matches!(arrow["note"].as_str(), Some("hold" | "roll"));
+                assert_eq!(arrow.get("end").is_some(), held, "{arrow}");
+                assert!(!held || arrow["end"].as_f64().unwrap() > note.time, "{arrow}");
+            }
+        }
+
+        // Every technique the statistics count, in order of its first note, inside the chart
+        let found = footing["techniques"].as_array().unwrap();
+        let count = |key: &str| found.iter().filter(|technique| technique["technique"] == key).count();
+        for technique in Technique::ALL {
+            let key = technique.key();
+            assert_eq!(Some(count(&key) as f64), json["features"][format!("{key}_count")].as_f64(), "{key}");
+        }
+        let firsts: Vec<usize> = found.iter().map(|technique| number(&technique["first_note"])).collect();
+        assert!(firsts.is_sorted(), "{firsts:?}");
+        assert!(found.iter().all(|technique| number(&technique["first_note"]) + number(&technique["notes"]) <= notes.len()));
+        // The fixture's: 2 doublesteps, a bracket and a gallop
+        assert_eq!((count("doublestep"), count("bracket"), count("gallop")), (2, 1, 1));
+        // A kind is found beside what it's a kind of
+        for kind in found.iter().filter(|technique| technique.get("kind_of").is_some()) {
+            let parent = |technique: &&serde_json::Value| technique["technique"] == kind["kind_of"] && technique["first_note"] == kind["first_note"];
+            assert!(found.iter().any(|technique| parent(&technique)), "{kind}");
+        }
+        // The notes' costs make the segments'
+        let total = |values: &[serde_json::Value]| values.iter().map(|value| value["cost"].as_f64().unwrap()).sum::<f64>();
+        assert!((total(notes) - total(segments)).abs() < 1e-9);
     }
 
     #[test]
