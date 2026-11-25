@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use crate::chart_analyzer::{Costs, Events, Solution, TimedNote, foot_segment};
+use crate::chart_analyzer::{Costs, Events, Solution, Technique, TimedNote, foot_segment};
 use crate::sim_loader::ChartDifficulty;
 
 /// The counts compared, in the sheet's column names. The first `SCORED` make the score.
@@ -43,24 +43,22 @@ fn all_counts(events: &Events) -> Counts {
 pub fn counts(notes: &[TimedNote], footing: &Solution) -> Counts {
     let single = |note: &TimedNote| (0..4).filter(|&arrow| note.steps(arrow)).count() == 1;
     let mut counts = [0.0; 6];
-    for (i, events) in footing.step_events.iter().enumerate() {
-        let [crossovers, footswitches, sideswitches, doublesteps, jacks, brackets] = all_counts(events);
-        counts[0] += crossovers;
-        counts[5] += brackets;
+    for occurrence in &footing.occurrences {
+        let i = occurrence.note;
         // The first note's gap is the break before the segment
-        let Some(before) = i.checked_sub(1).map(|before| &notes[before]) else { continue };
-        let gap = notes[i].time - before.time;
-        let singles = single(&notes[i]) && single(before);
-        if gap < FOOTSWITCH_CUTOFF_SECONDS {
-            counts[1] += footswitches;
-            counts[2] += sideswitches;
-        }
-        if singles && gap < DOUBLESTEP_CUTOFF_SECONDS {
-            counts[3] += doublesteps;
-        }
-        if singles && gap < JACK_CUTOFF_SECONDS {
-            counts[4] += jacks;
-        }
+        let before = i.checked_sub(1).map(|before| &notes[before]);
+        let within = |cutoff: f64| before.is_some_and(|before| notes[i].time - before.time < cutoff);
+        let singles = before.is_some_and(|before| single(&notes[i]) && single(before));
+        let column = match occurrence.technique {
+            Technique::HorizontalCrossover => 0,
+            Technique::VerticalFootswitch if within(FOOTSWITCH_CUTOFF_SECONDS) => 1,
+            Technique::Sideswitch if within(FOOTSWITCH_CUTOFF_SECONDS) => 2,
+            Technique::Doublestep if singles && within(DOUBLESTEP_CUTOFF_SECONDS) => 3,
+            Technique::Jack if singles && within(JACK_CUTOFF_SECONDS) => 4,
+            Technique::Bracket => 5,
+            _ => continue,
+        };
+        counts[column] += 1.0;
     }
     counts
 }

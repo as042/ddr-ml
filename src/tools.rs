@@ -14,7 +14,7 @@ use burn::optim::AdamWConfig;
 use burn::prelude::*;
 
 use crate::chart_analyzer::{
-    COSTS, ChartStatistics, Costs, Events, Foot, FootedSegment, Patterns, analyze_singles, foot_arrows, foot_chart,
+    COSTS, ChartStatistics, Costs, Foot, FootedSegment, Source, Technique, analyze_singles, foot_arrows, foot_chart,
     footing_segments,
 };
 #[cfg(test)]
@@ -36,6 +36,9 @@ const PCA_FILE: &str = "artifacts/pca.json";
 const SPLIT_SEED: u64 = 643;
 /// Test-set predictions to print at the end.
 const EXAMPLES: usize = 12;
+/// An official rating N spans N.0 up to N + 1 on the model's scale. A chart trains as its middle.
+const LEVEL_MIDDLE: f32 = 0.5;
+const SCALE_NOTE: &str = "predicted: 14.00 is the easiest 14, 14.50 a typical 14";
 
 struct Sample {
     name: String,
@@ -50,9 +53,9 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     // Small batches: with only a few hundred charts, they make more steps per epoch.
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
-    let ratings: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating]).collect();
-    let dataset = Dataset::from_rows(&inputs, &ratings, &DevicePreference::default().device());
-    let model_config = ModelConfig::funnel(inputs[0].len(), 2, 256, 1).with_dropout(0.5);
+    let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
+    let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
+    let model_config = ModelConfig::funnel(inputs[0].len(), 1, 2048, 1).with_dropout(0.2);
     let weight_decay = 1.0;
     let input_noise = 0.2;
     println!(
@@ -75,7 +78,7 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let accuracy = test.metrics[0];
     println!(
-        "\nover all {} test charts: typically {:.2} levels off (RMS), at most {:.2}",
+        "\n{SCALE_NOTE}\nover all {} test charts: typically {:.2} levels from the middle of their rating (RMS), at most {:.2}",
         test.rows.len(),
         accuracy.rms_error(),
         accuracy.max_error
@@ -98,6 +101,7 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     let device = DevicePreference::default().device();
     let model = TrainedModel::load(MODEL_DIR, &device)
         .map_err(|e| format!("couldn't load the model in {MODEL_DIR} ({e}): has `train` been run?"))?;
+    println!("{SCALE_NOTE}\n");
     for path in args {
         let sim = SimFile::from_file(path).map_err(|e| format!("{path}: {e}"))?;
         println!("{} by {}", sim.title, sim.artist);
@@ -438,7 +442,7 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
                 summary.notes,
                 footed.len(),
                 summary.footing(),
-                pattern_counts(&summary.patterns)
+                summary.counts(Source::FootingPattern).unwrap_or("none".into())
             );
         }
         println!("\nadd a difficulty (e.g. hard) for one chart's footing");
@@ -481,8 +485,8 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
 /// Segments' footings added up.
 struct Summary {
     notes: usize,
-    events: Events,
-    patterns: Patterns,
+    /// Per `Technique::ALL`: how many, and the notes they span
+    found: [(usize, usize); Technique::ALL.len()],
     cost: f64,
     nodes: u64,
     merged: u64,
@@ -494,8 +498,7 @@ impl Summary {
     fn of(segments: &[FootedSegment]) -> Summary {
         let mut summary = Summary {
             notes: 0,
-            events: Events::default(),
-            patterns: Patterns::default(),
+            found: [(0, 0); Technique::ALL.len()],
             cost: 0.0,
             nodes: 0,
             merged: 0,
@@ -504,8 +507,11 @@ impl Summary {
         };
         for segment in segments {
             summary.notes += segment.notes.len();
-            summary.events += segment.footing.events;
-            summary.patterns += segment.footing.patterns;
+            for occurrence in &segment.footing.occurrences {
+                let (count, notes) = &mut summary.found[occurrence.technique.index()];
+                *count += 1;
+                *notes += occurrence.notes;
+            }
             summary.cost += segment.footing.cost;
             summary.nodes += segment.footing.nodes;
             summary.merged += segment.footing.merged;
@@ -515,19 +521,32 @@ impl Summary {
         summary
     }
 
-    /// "1 jack, 2 horizontal crossovers (cost 11.0)", or "nothing awkward". The cost depends on
+    /// The techniques from `source` that were found: "2 staircases, 1 drill (7 notes)". None if
+    /// none were. One with kinds is left to them.
+    fn counts(&self, source: Source) -> Option<String> {
+        let counted: Vec<String> = Technique::ALL
+            .into_iter()
+            .filter(|technique| technique.source() == source && technique.kinds().is_empty())
+            .filter_map(|technique| {
+                let (count, notes) = self.found[technique.index()];
+                let spanned = if technique.varies_in_length() { format!(" ({notes} notes)") } else { String::new() };
+                (count > 0).then(|| technique.counted(count) + &spanned)
+            })
+            .collect();
+        (!counted.is_empty()).then(|| counted.join(", "))
+    }
+
+    /// "1 jack, 2 full crossovers (cost 11.0)", or "nothing awkward". The cost depends on
     /// speed.
     fn footing(&self) -> String {
-        let counted: Vec<String> = event_counts(&self.events)
-            .into_iter()
-            .filter(|&(count, ..)| count > 0)
-            .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
-            .collect();
-        if counted.is_empty() { "nothing awkward".to_string() } else { format!("{} (cost {:.1})", counted.join(", "), self.cost) }
+        match self.counts(Source::FootingEvent) {
+            Some(events) => format!("{events} (cost {:.1})", self.cost),
+            None => "nothing awkward".to_string(),
+        }
     }
 
     fn patterns(&self) -> String {
-        format!("patterns: {}", pattern_counts(&self.patterns))
+        format!("patterns: {}", self.counts(Source::FootingPattern).unwrap_or("none".into()))
     }
 
     fn search(&self) -> String {
@@ -539,58 +558,35 @@ impl Summary {
     }
 }
 
-/// "2 staircases, 1 drill (7 notes), 3 gallops", or "none".
-fn pattern_counts(patterns: &Patterns) -> String {
-    let drills = match patterns.drills {
-        1 => format!("1 drill ({} notes)", patterns.drill_notes),
-        drills => format!("{drills} drills ({} notes)", patterns.drill_notes),
-    };
-    let counted: Vec<String> = [
-        (patterns.staircases, "1 staircase".to_string(), format!("{} staircases", patterns.staircases)),
-        (patterns.drills, drills.clone(), drills),
-        (patterns.gallops, "1 gallop".to_string(), format!("{} gallops", patterns.gallops)),
-        (patterns.triples, "1 triple".to_string(), format!("{} triples", patterns.triples)),
-    ]
-    .into_iter()
-    .filter(|&(count, ..)| count > 0)
-    .map(|(count, one, many)| if count == 1 { one } else { many })
-    .collect();
-    if counted.is_empty() { "none".to_string() } else { counted.join(", ") }
-}
-
-/// The patterns starting at one note: "staircase", "drill of 7", "gallop", "triple".
-fn pattern_labels(patterns: &Patterns) -> Vec<String> {
+/// What a footing has on note `note`, each with its notes per second: "doublestep 8.0/s",
+/// "2 jacks 4.0/s", "drill of 7 8.0/s". No speed with no note before. A technique with kinds is
+/// left to them.
+fn labels(segment: &FootedSegment, note: usize) -> Vec<String> {
+    let found: Vec<_> = segment.footing.at(note).filter(|found| found.technique.kinds().is_empty()).collect();
     let mut labels = Vec::new();
-    labels.extend((0..patterns.staircases).map(|_| "staircase".to_string()));
-    if patterns.drills > 0 {
-        labels.push(format!("drill of {}", patterns.drill_notes));
+    for (i, occurrence) in found.iter().enumerate() {
+        let technique = occurrence.technique;
+        if found[..i].iter().any(|earlier| earlier.technique == technique) {
+            continue;
+        }
+        let count = found.iter().filter(|other| other.technique == technique).count();
+        let mut label = match (technique.varies_in_length(), count) {
+            (true, _) => format!("{} of {}", technique.name(), occurrence.notes),
+            (false, 1) => technique.name().to_string(),
+            (false, _) => technique.counted(count),
+        };
+        if occurrence.speed > 0.0 {
+            let _ = write!(label, " {:.1}/s", occurrence.speed);
+        }
+        labels.push(label);
     }
-    labels.extend((0..patterns.gallops).map(|_| "gallop".to_string()));
-    labels.extend((0..patterns.triples).map(|_| "triple".to_string()));
     labels
-}
-
-/// (count, singular, plural) of each kind of event.
-fn event_counts(events: &Events) -> [(usize, &'static str, &'static str); 11] {
-    [
-        (events.jacks, "jack", "jacks"),
-        (events.vertical_crossovers, "vertical crossover", "vertical crossovers"),
-        (events.vertical_footswitches, "vertical footswitch", "vertical footswitches"),
-        (events.sideswitches, "sideswitch", "sideswitches"),
-        (events.footing.horizontal_crossovers, "horizontal crossover", "horizontal crossovers"),
-        (events.brackets, "bracket", "brackets"),
-        (events.doublesteps, "doublestep", "doublesteps"),
-        (events.footing.laterals, "lateral", "laterals"),
-        (events.footing.half_spins, "half spin", "half spins"),
-        (events.freeze_switches, "freeze switch", "freeze switches"),
-        (events.footing.full_spins, "full spin", "full spins"),
-    ]
 }
 
 /// A footing as a table: a row per note, with `L` or `R` under each arrow for the foot that steps
 /// it (the same letter twice for a bracket, `x` for an arrow no foot can reach), `|` under an arrow
 /// still held from earlier in the segment (`l` or `r` where that foot takes the hold over in a
-/// freeze switch), then what the step is and the patterns that start there. Rows are labelled by
+/// freeze switch), then what the step is and the patterns that start there (see `labels`). Rows are labelled by
 /// measure and beat if `by_measure`.
 /// Else they are numbered, a row is a 16th, and the empty 16ths between notes get a row too.
 fn footing_table(segment: &FootedSegment, by_measure: bool) -> String {
@@ -631,12 +627,7 @@ fn footing_table(segment: &FootedSegment, by_measure: bool) -> String {
                 (true, None) => "x",
             })
             .collect();
-        let mut events: Vec<String> = event_counts(&segment.footing.step_events[i])
-            .into_iter()
-            .filter(|&(count, ..)| count > 0)
-            .map(|(count, one, many)| if count == 1 { one.to_string() } else { format!("{count} {many}") })
-            .collect();
-        events.extend(pattern_labels(&segment.footing.step_patterns[i]));
+        let events = labels(segment, i);
         for (arrow, end) in note.hold_ends.iter().enumerate() {
             if let Some(end) = end {
                 held_until[arrow] = *end;
@@ -664,7 +655,7 @@ fn default_songs_folder() -> PathBuf {
 }
 
 /// `load_samples` through the statistics cache in `CACHE_FILE`, which it updates.
-fn cached_samples(songs: &Path) -> Result<(Vec<&'static str>, Vec<Sample>), Box<dyn Error>> {
+fn cached_samples(songs: &Path) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut cache = StatsCache::load(CACHE_FILE)?;
     let (feature_names, samples) = load_samples(songs, &mut cache)?;
     if samples.is_empty() {
@@ -686,10 +677,11 @@ fn cached_samples(songs: &Path) -> Result<(Vec<&'static str>, Vec<Sample>), Box<
 }
 
 /// A chart's statistics as model inputs, or the name of one that isn't a finite number.
-fn finite_features(stats: &ChartStatistics) -> Result<Vec<f32>, &'static str> {
-    match stats.features().iter().find(|(_, value)| !value.is_finite()) {
-        Some(&(feature, _)) => Err(feature),
-        None => Ok(stats.features().iter().map(|&(_, value)| value as f32).collect()),
+fn finite_features(stats: &ChartStatistics) -> Result<Vec<f32>, String> {
+    let features = stats.features();
+    match features.iter().find(|(_, value)| !value.is_finite()) {
+        Some((feature, _)) => Err(feature.clone()),
+        None => Ok(features.iter().map(|&(_, value)| value as f32).collect()),
     }
 }
 
@@ -698,7 +690,7 @@ fn finite_features(stats: &ChartStatistics) -> Result<Vec<f32>, &'static str> {
 ///
 /// Read in sorted order: listing order differs between machines, and would change the seeded
 /// split.
-fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<&'static str>, Vec<Sample>), Box<dyn Error>> {
+fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut feature_names = Vec::new();
     let mut samples = Vec::new();
     for song in sorted_paths(songs)?.into_iter().filter(|path| path.is_dir()) {
@@ -713,7 +705,7 @@ fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<&'static st
             };
             for chart in charts {
                 let name = format!("{song_name} [{:?}]", chart.difficulty);
-                feature_names = chart.stats.features().iter().map(|&(feature, _)| feature).collect();
+                feature_names = chart.stats.features().into_iter().map(|(feature, _)| feature).collect();
                 match finite_features(&chart.stats) {
                     Ok(features) => samples.push(Sample { name, features, rating: chart.rating as f32 }),
                     Err(feature) => eprintln!("skipping {name}: its {feature} isn't a finite number"),
@@ -726,7 +718,9 @@ fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<&'static st
 
 /// Fits a PCA on the training split's features (the split `train` trains on), prints it and
 /// saves it to `PCA_FILE`.
-fn report_pca(feature_names: &[&str], samples: &[Sample]) -> Result<(), Box<dyn Error>> {
+fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dyn Error>> {
+    let feature_names: Vec<&str> = feature_names.iter().map(String::as_str).collect();
+    let feature_names = &feature_names[..];
     let (train_rows, val_rows, test_rows) = train::split_rows(samples.len(), &TrainingConfig::new().with_split_seed(SPLIT_SEED));
     let features = |rows: &[usize]| -> Vec<Vec<f32>> { rows.iter().map(|&row| samples[row].features.clone()).collect() };
     let train = features(&train_rows);
@@ -792,9 +786,9 @@ mod tests {
 
     #[test]
     fn draws_a_footing() {
+        // Typed arrows are 0.125 s apart: 8 notes a second
         let crossover = foot_arrows("LDR", &COSTS, 1.0).unwrap();
-        let numbered =
-            "  #   ←  ↓  ↑  →\n  1   L  .  .  .   triple\n  2   .  R  .  .\n  3   .  .  .  L   horizontal crossover\n";
+        let numbered = "  #   ←  ↓  ↑  →\n  1   L  .  .  .   triple 8.0/s\n  2   .  R  .  .\n  3   .  .  .  L   full crossover 8.0/s\n";
         assert_eq!(footing_table(&crossover, false), numbered);
         // 16ths: the fifth starts the second measure
         let by_measure = footing_table(&foot_arrows("LR[UD]LR", &COSTS, 1.0).unwrap(), true);
@@ -812,7 +806,7 @@ mod tests {
         let rows: Vec<&str> = held.lines().collect();
         assert_eq!(rows[1], "  1   .  L  .  .");
         assert_eq!(rows[2], "  2   .  |  .  R");
-        assert_eq!(rows[3], "  3   .  r  L  .   freeze switch");
+        assert_eq!(rows[3], "  3   .  r  L  .   freeze switch 8.0/s");
 
         // Empty rows: Down is let go on the third
         let paused = footing_table(&foot_arrows("D+  D-L", &COSTS, 1.0).unwrap(), false);
@@ -853,7 +847,7 @@ mod tests {
             + COSTS.vertical_footswitch.speed
             + COSTS.horizontal_crossover.base
             + COSTS.horizontal_crossover.speed;
-        assert_eq!(summary.footing(), format!("1 vertical footswitch, 1 horizontal crossover (cost {cost:.1})"));
+        assert_eq!(summary.footing(), format!("1 down footswitch, 1 full crossover (cost {cost:.1})"));
         // LDR and LR
         assert_eq!(summary.patterns(), "patterns: 1 gallop, 1 triple");
         assert_eq!(Summary::of(&segments[1..2]).patterns(), "patterns: none");

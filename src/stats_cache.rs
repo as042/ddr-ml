@@ -19,11 +19,17 @@ use crate::sim_loader::{SimFile, simfile_path};
 
 /// The source files that decide a simfile's statistics, with their paths from `src/`. Any change
 /// to them, even to a comment, makes every cached entry out of date.
-const FINGERPRINTED: [(&str, &str); 5] = [
+const FINGERPRINTED: [(&str, &str); 11] = [
     ("sim_loader.rs", include_str!("sim_loader.rs")),
     ("chart_analyzer.rs", include_str!("chart_analyzer.rs")),
+    ("chart_analyzer/counts.rs", include_str!("chart_analyzer/counts.rs")),
+    ("chart_analyzer/radar.rs", include_str!("chart_analyzer/radar.rs")),
+    ("chart_analyzer/technique.rs", include_str!("chart_analyzer/technique.rs")),
+    ("chart_analyzer/sequences.rs", include_str!("chart_analyzer/sequences.rs")),
+    ("chart_analyzer/statistics.rs", include_str!("chart_analyzer/statistics.rs")),
     ("chart_analyzer/footing.rs", include_str!("chart_analyzer/footing.rs")),
     ("chart_analyzer/footing/patterns.rs", include_str!("chart_analyzer/footing/patterns.rs")),
+    ("chart_analyzer/footing/moves.rs", include_str!("chart_analyzer/footing/moves.rs")),
     ("stats_cache.rs", include_str!("stats_cache.rs")),
 ];
 

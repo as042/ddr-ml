@@ -30,6 +30,36 @@
 // apart, which an f64 can't hold exactly, so the note 6 later can come out a hair under 1 s
 // after one, and has to be left out of its window all the same.
 // Challenge's windows, by measure: 2 2 2 3 | 4 4 4 4 4 5 6 7 | 8 8 7 6 5 5 4 3 2 2 | 1
+//
+// Of the same windows: the mode (ties go to the smaller), the standard deviation, and the min,
+// which only takes the windows that end by the last note (0 with none):
+//   chart      mode  std            min
+//   Easy       2     sqrt(74)/13    1
+//   Medium     1     0              0
+//   Hard       6     sqrt(655)/16   6
+//   Challenge  4     sqrt(2080)/23  2
+// Both stops are between Easy's first and last notes: 2 stops, 1.25 s, 15/91 of its 7.5833 s.
+// The other charts start after them.
+//
+// Seconds from each note to the next, the fastest 2, 3, 5, 7 and 15 notes in a row (in notes per
+// second: a note fewer than the run has, over its seconds) and the closest two jumps (1 over
+// their seconds):
+//   chart      mean    median  mode   max   fastest 2  3  5  7    15   jumps
+//   Easy       91/144  0.5     0.5    1.25          4  4  2  1.8  0    0
+//   Hard       1/6     1/6     1/6    1/6           6  6  6  6    6    3
+//   Challenge  3/11    0.25    0.125  0.5           8  8  8  8    5.6  2
+// Easy's gaps: 0.5 0.5 1.25 0.5 2/3 5/6 1 0.25 0.25 0.5 1 1/3. Its fastest 5 notes take 2 s
+// (from 5.25 s) and its fastest 7 take 10/3 s (from 4.25 s).
+// Challenge's gaps: 0.5 four times, 0.25 eight, 0.125 eight, 0.5 twice. The mode's tie goes to
+// 0.125. Its fastest 15 notes take 2.5 s: six gaps of 0.25, then the eight of 0.125.
+//
+// The most notes in any 5, 10 and 30 s (each over its seconds), and the longest run of notes
+// with no gap over 1 s:
+//   chart      5 s  10 s  30 s  run
+//   Easy       9    13    13    10 notes, 16/3 s (2.25 to 7.5833: the 1.25 s gap before breaks it)
+//   Medium     1    1     1     1 note, 0 s
+//   Hard       16   16    16    16 notes, 2.5 s
+// Easy's best 5 s start at 2.75 s.
 #TITLE:NPS Stats;
 #ARTIST:ddr-trainer;
 #MUSIC:nps_stats.ogg;

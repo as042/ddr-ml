@@ -5,34 +5,57 @@
 // One BPM (120, so quarter notes are 0.5 s apart and 8ths 0.25 s), no stops.
 //   - the duration runs from the chart's first object (a note, mine or hold end) to its last,
 //     and the active ratio is the fraction of it between notes at most 1 s apart, or holding
-//   - the foot simulation splits the notes into segments at gaps longer than 0.5 s, so quarter
-//     notes stay in one. Each segment starts with the feet at home (left foot on Left, right
-//     on Right) and gets the cheapest footing by the simulation's costs. The tests use fixed
-//     ones (TEST_COSTS in src/chart_analyzer/footing.rs), where an event costs its base plus
-//     its speed cost times how fast the notes are (1 for notes 0.125 s apart, so 0.25 for
-//     quarter notes here and 0.5 for 8ths): a horizontal crossover 4 + 1 x speed, a doublestep
+//   - the notes are split into segments at gaps longer than 2 s. The foot simulation starts
+//     each segment with the feet at home (left foot on Left, right on Right) and gives it
+//     the cheapest footing by its costs. The tests use fixed ones (TEST_COSTS in
+//     src/chart_analyzer/footing.rs), where an event costs its base plus its speed cost
+//     times how fast the notes are (1 for notes 0.125 s apart, so 0.25 for quarter notes
+//     here and 0.5 for 8ths): a horizontal crossover 4 + 1 x speed, a doublestep
 //     1 + 7 x speed, a bracket 6 + 1 x speed, a full spin 16 + 4 x speed
+//   - each event and pattern found has its own speed in notes per second: an event's is 1
+//     over the gap since the note before, a pattern's its notes less one over its seconds.
+//     So 2 for quarter notes here and 4 for 8ths
 //
-//   chart      duration  active  doublesteps  brackets  staircases
-//   Beginner   0         0       0            0         0           nothing in it
-//   Easy       7         1/2     0            0         1           duration
-//   Medium     3.5       4/7     2            0         0           breaks reset
-//   Hard       2.75      6/11    0            0         0           either foot starts
-//   Challenge  6         7/12    2            1         0           realistic mix
+//   chart      duration  active  segments  doublesteps  brackets  staircases  gallops
+//   Beginner   0         0       none      0            0         0           0
+//   Easy       7         1/2     5 1       0            0         1 at 2      0
+//   Medium     5.5       4/11    3 3       2 at 2       0         0           0
+//   Hard       4.75      6/19    4 4       0            0         0           0
+//   Challenge  10        7/20    6 4 6     2 at 4       1 at 4    0           1 at 4
 //
-// Every other event and pattern count is 0 in every chart.
-// Easy: 2 s to 9 s (a mine), active from 2 s to 5.5 s (quarter notes, then a hold). Left, Down,
-//   Up, Right is a staircase, however slow.
-// Medium: Left, Down, Right in quarter notes, twice, with a 1.5 s break between. Alternating
+// Segments are in notes. Every other event and pattern count is 0 in every chart.
+// Each note costs what its step's events do, so 0 for most. Per note, over the chart:
+//   Medium: 2 doublesteps of 2.75 on 6 notes: mean 5.5/6, median 0, max 2.75
+//   Challenge: 2 doublesteps of 4.5 and a bracket of 6.5 on 16 notes: mean 15.5/16, median 0,
+//   max 6.5. Nothing costs anything in the other charts.
+// Cost per second: per note, the costs of the notes from it to less than 1 s later.
+//   Medium: each doublestep is the third of three notes 0.5 s apart, so in the windows of
+//   the second and third: 0, 2.75, 2.75, twice. Mean 11/6, median 2.75, max 2.75
+//   Challenge: the doublesteps are on the third and fifth of the first six notes, 0.25 s
+//   apart: 4.5, 9, 9, 4.5, 4.5, 0. The bracket is on the third of the last six, the first
+//   four 0.25 s apart: 6.5, 6.5, 6.5, 0, 0, 0. With 4 notes of 0 between: mean 51/16,
+//   median (0 + 4.5)/2, max 9
+// Easy (duration): 2 s to 9 s (a mine), active from 2 s to 5.5 s (quarter notes, then a
+//   hold). Left, Down, Up, Right is a staircase, however slow.
+// Medium (breaks reset): Left, Down, Right in quarter notes, twice, 3.5 s apart. Alternating
 //   would cross the left foot over to Right (4.25). The right foot stepping Down then Right is
 //   a doublestep (2.75), which is cheaper this slow. The feet go home in the break.
-// Hard: Up, Left, Up, Left crosses over if the left foot starts, so the right foot does, and
-//   after a break Up, Right, Up, Right crosses over if the right foot starts, so the left does.
-// Challenge: Left, Down, Right, Up, Left, Down in 8ths alternates into a crossover and a full
-//   spin (22.5). Two doublesteps (4.5 each) get round the pad without turning. Then Up, Left,
-//   Up, Left as in Hard. Then a hold on Left with Down, Up, Down under it: the right foot would
-//   doublestep twice (9), so the left foot taps Up while it holds Left, a bracket (6.5), and
-//   the right foot stays on Down.
+// Hard (either foot starts): Up, Left, Up, Left crosses over if the left foot starts, so the
+//   right foot does, and after a break Up, Right, Up, Right crosses over if the right foot
+//   starts, so the left does.
+// Challenge (realistic mix): Left, Down, Right, Up, Left, Down in 8ths alternates into a
+//   crossover and a full spin (22.5). Two doublesteps (4.5 each) get round the pad without
+//   turning. Then Up, Left, Up, Left as in Hard. Then a hold on Left with Down, Up, Down under
+//   it: the right foot would doublestep twice (9), so the left foot taps Up while it holds
+//   Left, a bracket (6.5), and the right foot stays on Down. The last two notes, Up and Right
+//   0.25 s apart and 0.5 s after the note before, are a gallop.
+// A foot's move is a step after an earlier one of its own in the segment: its speed is 1 over
+// the seconds between, its distance is across the pad (2 from Left to Right, sqrt(2) between
+// neighbours) and its velocity is the one times the other.
+//   Easy: the left foot goes Left, Up, Left and the right Down, Right, each 1 s after its
+//     last step: 3 moves of sqrt(2) at speed 1
+//   Medium: the doublestepping right foot goes Down to Right in 0.5 s, twice: 2 moves of
+//     sqrt(2) at speed 2, velocity 2 sqrt(2). The left foot steps once a segment: no move.
 #TITLE:Footing Stats;
 #ARTIST:ddr-trainer;
 #MUSIC:footing_stats.ogg;
@@ -110,7 +133,12 @@
 0100
 0001
 0000
-,  // measure 1: after a 1.5 s break, the same again
+,  // measure 1: empty
+0000
+0000
+0000
+0000
+,  // measure 2: after a 3.5 s break, the same again
 0000
 1000
 0100
@@ -133,7 +161,12 @@
 0000
 0000
 0000
-,  // measure 1: after a 1.25 s break, Up, Right, Up, Right, started by the left foot
+,  // measure 1: empty
+0000
+0000
+0000
+0000
+,  // measure 2: after a 3.25 s break, Up, Right, Up, Right, started by the left foot
 0010
 0001
 0010
@@ -160,7 +193,12 @@
 0100
 0000
 0000
-,  // measure 1: after a 1.25 s break, Up, Left, Up, Left, started by the right foot
+,  // measure 1: empty
+0000
+0000
+0000
+0000
+,  // measure 2: after a 3.25 s break, Up, Left, Up, Left, started by the right foot
 0000
 0000
 0010
@@ -169,7 +207,12 @@
 1000
 0000
 0000
-,  // measure 2: after a 1.25 s break, a hold on Left with Down, Up, Down under it (a bracket), then Up
+,  // measure 3: empty
+0000
+0000
+0000
+0000
+,  // measure 4: after a 3.25 s break, a hold on Left with Down, Up, Down under it (a bracket), then Up
 0000
 0000
 2000
@@ -178,7 +221,7 @@
 0100
 3000
 0010
-,  // measure 3: Right
+,  // measure 5: Right: with the Up, a gallop
 0001
 0000
 0000

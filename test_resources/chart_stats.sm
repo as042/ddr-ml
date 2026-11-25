@@ -26,6 +26,31 @@
 //   Medium     4         24     0     0     0     0         2       2    8        0  a tied mode
 //   Hard       6         83     0     1     0     3        13       6    4        3  subdivisions
 //   Challenge  9         55     7     3     1     2        11       4    8        1  realistic mix
+//
+// Arrows per panel (a jump is two), lopsidedness (the most on a panel less the fewest, over all;
+// and the panels' distances from their mean, added up, over all) and biases (Right's share of
+// Left and Right, Up's of Down and Up, Down and Up's of all; 0.5 with none to share):
+//   chart      left down up right  by max  by mean  right  up   vertical
+//   Beginner      0    0  0     0  0       0        0.5    0.5  0.5
+//   Easy          8    5  3     4  5/20    6/20     4/12   3/8  8/20
+//   Medium        6    6  6     6  0       0        0.5    0.5  0.5
+// Each note's own subdivision, whatever else is in its measure:
+//   chart      4ths 8ths 12ths 16ths 24ths 32nds  distinct mode finest  mean    advanced
+//   Easy         14    0     0     0     0     0         1    4      4  4       0
+//   Medium        8    8     0     8     0     0         3    4     16  224/24  0
+//   Hard         43   15    14     8     2     1         6    4     32  668/83  16/83
+// Easy's 4 holds and its roll last 1, 1, 1, 1.5 and 1.5 s and start on 4 notes: 6 s in all,
+// 1.2 s on average.
+// Easy's estimated groove radar (DDR A's formulas, each rate and value rounded down). The
+// song is the 40 beats to the end of its last used measure, 20 s:
+//   stream 14: 14 notes, 42 a minute, over 3
+//   voltage 20: at most 4 notes or mines in any 4 beats, 120 a minute at 120 BPM, over 6
+//   air 27: 5 jumps, 15 a minute, times 20/11
+//   freeze 64: 2 + 2 + 2 + 3 beats held (the two holds that start together count once), 2250
+//     ten-thousandths of 40, over 35
+//   chaos 0: every note and mine is on a beat
+// Easy has one held step: the tap on Right 0.5 s into the first hold (2 a second). The taps
+// that start or end with a hold aren't under it.
 #TITLE:Chart Stats;
 #ARTIST:ddr-trainer;
 #MUSIC:chart_stats.ogg;

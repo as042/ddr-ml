@@ -1,137 +1,18 @@
+mod counts;
 mod footing;
-
-use std::collections::BTreeMap;
+mod radar;
+mod sequences;
+mod statistics;
+mod technique;
 
 use serde::{Deserialize, Serialize};
 
 use crate::sim_loader::{BPMChange, ChartDifficulty, Measure, Note, SimFile, SingleChart, StepChart, Stop};
-pub use footing::patterns::Patterns;
 #[cfg(test)]
 pub use footing::{Cost, TEST_COSTS};
 pub use footing::{COSTS, Costs, Events, Foot, Solution};
-
-/// Difficulty statistics for a given chart. Used to train a model to predict chart rating.
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChartStatistics {
-    // General stuff
-    /// Seconds from the first object (note, mine or hold end) to the last
-    chart_dur: f64,
-    /// Measures from the first non-empty one to the last
-    chart_num_measures: usize,
-    /// Fraction of `chart_dur` spent holding, or between notes at most `ACTIVE_GAP_SECONDS` apart
-    chart_active_ratio: f64,
-
-    // Basic counts
-    /// Rows with a tap, hold head or roll head (a jump is one note)
-    num_notes: usize,
-    /// Notes with 2+ arrows, hands included
-    num_jumps: usize,
-    /// Hold heads
-    num_holds: usize,
-    num_mines: usize,
-    /// Roll heads (not in `num_holds`)
-    num_rolls: usize,
-
-    // Notes per second: notes in the window starting at each note (see `windows`)
-    mean_notes_per_second: f64,
-    median_notes_per_second: f64,
-    max_notes_per_second: f64,
-
-    // Jacks: notes sharing an arrow with the note before them in the same segment
-    num_jacks: usize,
-    // Jack speed: jacks in the window starting at each jack, within its segment
-    mean_jacks_per_second: f64,
-    median_jacks_per_second: f64,
-    max_jacks_per_second: f64,
-
-    // Streams: segments of at least `MIN_STREAM_NOTES` notes. Length in notes.
-    num_streams: usize,
-    mean_stream_len: f64,
-    median_stream_len: f64,
-    max_stream_len: f64,
-
-    // Footing: the events of the foot simulation's cheapest footing (see `footing::Events`)
-    /// Repeated arrows stepped by the same foot. `num_jacks` is every repeated arrow.
-    num_same_foot_jacks: usize,
-    num_vertical_footswitches: usize,
-    num_sideswitches: usize,
-    num_horizontal_crossovers: usize,
-    num_vertical_crossovers: usize,
-    num_doublesteps: usize,
-    num_brackets: usize,
-    num_freeze_switches: usize,
-    num_laterals: usize,
-    num_half_spins: usize,
-    num_full_spins: usize,
-
-    // Patterns found on that footing (see `footing::patterns::Patterns`)
-    num_staircases: usize,
-    num_drills: usize,
-    num_drill_notes: usize,
-    num_gallops: usize,
-    num_triples: usize,
-
-    // Rhythms and timings. A measure's subdivision is the finest its notes need (see `row_sub_div`).
-    /// Distinct subdivisions among the measures
-    num_sub_divs: usize,
-    /// Most common subdivision (e.g. 8 = 8th notes). Ties go to the smaller.
-    mode_sub_div: usize,
-    /// Measures with a non-power-of-2 subdivision (12, 24, 48, ...)
-    num_adv_sub_divs: usize,
-    /// BPM with the most time between the first and last objects. Ties go to the smaller.
-    mode_bpm: f64,
-    /// BPM changes strictly between the first and last objects, not counting changes to the
-    /// same BPM
-    num_bpm_changes: usize,
-}
-
-impl ChartStatistics {
-    /// (name, value) pairs in field order: the model's input features.
-    pub fn features(&self) -> [(&'static str, f64); 40] {
-        [
-            ("chart_dur", self.chart_dur),
-            ("chart_num_measures", self.chart_num_measures as f64),
-            ("chart_active_ratio", self.chart_active_ratio),
-            ("num_notes", self.num_notes as f64),
-            ("num_jumps", self.num_jumps as f64),
-            ("num_holds", self.num_holds as f64),
-            ("num_mines", self.num_mines as f64),
-            ("num_rolls", self.num_rolls as f64),
-            ("mean_notes_per_second", self.mean_notes_per_second),
-            ("median_notes_per_second", self.median_notes_per_second),
-            ("max_notes_per_second", self.max_notes_per_second),
-            ("num_jacks", self.num_jacks as f64),
-            ("mean_jacks_per_second", self.mean_jacks_per_second),
-            ("median_jacks_per_second", self.median_jacks_per_second),
-            ("max_jacks_per_second", self.max_jacks_per_second),
-            ("num_streams", self.num_streams as f64),
-            ("mean_stream_len", self.mean_stream_len),
-            ("median_stream_len", self.median_stream_len),
-            ("max_stream_len", self.max_stream_len),
-            ("num_same_foot_jacks", self.num_same_foot_jacks as f64),
-            ("num_vertical_footswitches", self.num_vertical_footswitches as f64),
-            ("num_sideswitches", self.num_sideswitches as f64),
-            ("num_horizontal_crossovers", self.num_horizontal_crossovers as f64),
-            ("num_vertical_crossovers", self.num_vertical_crossovers as f64),
-            ("num_doublesteps", self.num_doublesteps as f64),
-            ("num_brackets", self.num_brackets as f64),
-            ("num_freeze_switches", self.num_freeze_switches as f64),
-            ("num_laterals", self.num_laterals as f64),
-            ("num_half_spins", self.num_half_spins as f64),
-            ("num_full_spins", self.num_full_spins as f64),
-            ("num_staircases", self.num_staircases as f64),
-            ("num_drills", self.num_drills as f64),
-            ("num_drill_notes", self.num_drill_notes as f64),
-            ("num_gallops", self.num_gallops as f64),
-            ("num_triples", self.num_triples as f64),
-            ("num_sub_divs", self.num_sub_divs as f64),
-            ("mode_sub_div", self.mode_sub_div as f64),
-            ("num_adv_sub_divs", self.num_adv_sub_divs as f64),
-            ("mode_bpm", self.mode_bpm),
-            ("num_bpm_changes", self.num_bpm_changes as f64),
-        ]
-    }
-}
+pub use statistics::ChartStatistics;
+pub use technique::{Source, Technique};
 
 impl StepChart {
     /// `bpms` and `stops` are shared by all of a .sm file's charts.
@@ -169,38 +50,27 @@ pub fn analyze_singles(sim: &SimFile) -> Vec<AnalyzedChart> {
 /// `costs`: the foot simulation's.
 fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs) -> ChartStatistics {
     let timing = Timing::new(bpms, stops);
-    let mut stats = ChartStatistics::default();
-    let span = count_notes_and_rhythms(&chart.measures, &mut stats);
-    count_bpms(&timing, span, &mut stats);
-
     let notes = to_timed_notes(&chart.measures, &timing);
-    count_notes_per_second(&notes, &mut stats);
+    let mut stats = ChartStatistics::default();
+    counts::count(&chart.measures, &notes, &timing, &mut stats);
+    radar::count(&chart.measures, &timing, &mut stats);
 
-    count_duration(&notes, &timing, span, &mut stats);
-
-    let pattern_segments = segments(&notes, SEGMENT_BREAK_SECONDS);
-    count_jacks(&pattern_segments, &mut stats);
-    count_streams(&pattern_segments, &mut stats);
-    count_footing(&segments(&notes, FOOTING_BREAK_SECONDS), costs, &mut stats);
+    let (mut occurrences, mut note_costs, mut moves) = (Vec::new(), Vec::new(), Vec::new());
+    for segment in segments(&notes, SEGMENT_BREAK_SECONDS) {
+        occurrences.extend(sequences::find(segment));
+        let footing = foot_segment(segment, costs);
+        occurrences.extend(footing.occurrences);
+        note_costs.extend(footing.note_costs);
+        moves.extend(footing.moves);
+    }
+    stats.techniques = statistics::summarize(&occurrences);
+    counts::count_costs(&notes, note_costs, &mut stats);
+    counts::count_feet(&moves, &mut stats);
     stats
 }
 
-/// Sliding window length (see `windows`).
-const WINDOW_SECONDS: f64 = 1.0;
-
-/// Longest gap between notes of one segment (see `segments`). 8ths at 120 BPM are exactly this
-/// far apart.
-const SEGMENT_BREAK_SECONDS: f64 = 0.25;
-
-/// Minimum notes for a segment to be a stream.
-const MIN_STREAM_NOTES: usize = 8;
-
-/// Longer gaps between notes are breaks, not active time.
-const ACTIVE_GAP_SECONDS: f64 = 1.0;
-
-/// Segment break for the foot simulation. Longer than `SEGMENT_BREAK_SECONDS`: players keep
-/// alternating feet through quarter notes.
-const FOOTING_BREAK_SECONDS: f64 = 0.5;
+/// Longest gap between notes of one segment (see `segments`).
+const SEGMENT_BREAK_SECONDS: f64 = 2.0;
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
 /// 1000 BPM are 1.25 ms apart).
@@ -305,72 +175,8 @@ fn to_timed_notes(measures: &[Measure], timing: &Timing) -> Vec<TimedNote> {
     notes
 }
 
-/// For each note, the notes from it up to (but not including) one window later. `notes` must be
-/// in time order.
-fn windows(notes: &[TimedNote]) -> impl Iterator<Item = &[TimedNote]> {
-    let mut end = 0;
-    (0..notes.len()).map(move |start| {
-        let window_end = notes[start].time + WINDOW_SECONDS - TIME_EPSILON;
-        end = end.max(start);
-        while end < notes.len() && notes[end].time < window_end {
-            end += 1;
-        }
-        &notes[start..end]
-    })
-}
-
-fn count_notes_per_second(notes: &[TimedNote], stats: &mut ChartStatistics) {
-    let per_second = windows(notes).map(|window| window.len() as f64 / WINDOW_SECONDS).collect();
-    (stats.mean_notes_per_second, stats.median_notes_per_second, stats.max_notes_per_second) =
-        mean_median_max(per_second);
-}
-
-/// `span`: beats of the first and last objects, from `count_notes_and_rhythms`.
-fn count_duration(notes: &[TimedNote], timing: &Timing, span: Option<(f64, f64)>, stats: &mut ChartStatistics) {
-    let Some((first, last)) = span else { return };
-    let (start, end) = (timing.time_at(first), timing.time_at(last));
-    stats.chart_dur = end - start;
-    if stats.chart_dur <= 0.0 {
-        return;
-    }
-
-    // Active intervals: note pairs with no break between them, and holds
-    let mut active: Vec<(f64, f64)> = notes
-        .windows(2)
-        .filter(|pair| pair[1].time - pair[0].time <= ACTIVE_GAP_SECONDS + TIME_EPSILON)
-        .map(|pair| (pair[0].time, pair[1].time))
-        .collect();
-    for note in notes {
-        active.extend(note.hold_ends.iter().flatten().map(|&hold_end| (note.time, hold_end)));
-    }
-    // Length of their union
-    active.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut covered = 0.0;
-    let mut covered_to = f64::NEG_INFINITY;
-    for (from, to) in active {
-        let from = from.max(covered_to);
-        if to > from {
-            covered += to - from;
-            covered_to = to;
-        }
-    }
-    stats.chart_active_ratio = covered / stats.chart_dur;
-}
-
-/// All 0 if `values` is empty.
-fn mean_median_max(mut values: Vec<f64>) -> (f64, f64, f64) {
-    if values.is_empty() {
-        return (0.0, 0.0, 0.0);
-    }
-    values.sort_by(f64::total_cmp);
-    let n = values.len();
-    let mean = values.iter().sum::<f64>() / n as f64;
-    let median = if n % 2 == 1 { values[n / 2] } else { (values[n / 2 - 1] + values[n / 2]) / 2.0 };
-    (mean, median, values[n - 1])
-}
-
 /// Runs of notes (in time order) with no gap longer than `break_seconds`. A longer gap lets the
-/// player reset their feet, so patterns are only looked for inside a segment.
+/// player reset their feet, so techniques are only looked for inside a segment.
 fn segments(notes: &[TimedNote], break_seconds: f64) -> Vec<&[TimedNote]> {
     notes.chunk_by(|a, b| b.time - a.time <= break_seconds + TIME_EPSILON).collect()
 }
@@ -387,7 +193,7 @@ pub struct FootedSegment {
 /// A chart's notes in segments, split as for the footing statistics.
 pub fn footing_segments(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop]) -> Vec<Vec<TimedNote>> {
     let notes = to_timed_notes(&chart.measures, &Timing::new(bpms, stops));
-    segments(&notes, FOOTING_BREAK_SECONDS).into_iter().map(<[TimedNote]>::to_vec).collect()
+    segments(&notes, SEGMENT_BREAK_SECONDS).into_iter().map(<[TimedNote]>::to_vec).collect()
 }
 
 /// The cheapest footing of a segment, from home.
@@ -493,66 +299,6 @@ pub fn foot_arrows(arrows: &str, costs: &Costs, speed: f64) -> Result<FootedSegm
     Ok(FootedSegment { notes, footing })
 }
 
-fn count_jacks(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
-    let mut per_second = Vec::new();
-    for &segment in segments {
-        let is_jack: Vec<bool> = (0..segment.len())
-            .map(|i| i > 0 && shares_an_arrow(&segment[i - 1], &segment[i]))
-            .collect();
-        stats.num_jacks += is_jack.iter().filter(|&&jack| jack).count();
-
-        // Jack speed. Windows stop at the segment's end.
-        for (start, window) in windows(segment).enumerate() {
-            if is_jack[start] {
-                let jacks = is_jack[start..start + window.len()].iter().filter(|&&jack| jack).count();
-                per_second.push(jacks as f64 / WINDOW_SECONDS);
-            }
-        }
-    }
-    (stats.mean_jacks_per_second, stats.median_jacks_per_second, stats.max_jacks_per_second) =
-        mean_median_max(per_second);
-}
-
-fn count_streams(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
-    let lengths: Vec<f64> = segments
-        .iter()
-        .map(|segment| segment.len())
-        .filter(|&notes| notes >= MIN_STREAM_NOTES)
-        .map(|notes| notes as f64)
-        .collect();
-    stats.num_streams = lengths.len();
-    (stats.mean_stream_len, stats.median_stream_len, stats.max_stream_len) = mean_median_max(lengths);
-}
-
-fn count_footing(segments: &[&[TimedNote]], costs: &Costs, stats: &mut ChartStatistics) {
-    let (mut events, mut patterns) = (Events::default(), Patterns::default());
-    for segment in segments {
-        let footing = foot_segment(segment, costs);
-        events += footing.events;
-        patterns += footing.patterns;
-    }
-    stats.num_same_foot_jacks = events.jacks;
-    stats.num_vertical_footswitches = events.vertical_footswitches;
-    stats.num_sideswitches = events.sideswitches;
-    stats.num_horizontal_crossovers = events.footing.horizontal_crossovers;
-    stats.num_vertical_crossovers = events.vertical_crossovers;
-    stats.num_doublesteps = events.doublesteps;
-    stats.num_brackets = events.brackets;
-    stats.num_freeze_switches = events.freeze_switches;
-    stats.num_laterals = events.footing.laterals;
-    stats.num_half_spins = events.footing.half_spins;
-    stats.num_full_spins = events.footing.full_spins;
-    stats.num_staircases = patterns.staircases;
-    stats.num_drills = patterns.drills;
-    stats.num_drill_notes = patterns.drill_notes;
-    stats.num_gallops = patterns.gallops;
-    stats.num_triples = patterns.triples;
-}
-
-fn shares_an_arrow(a: &TimedNote, b: &TimedNote) -> bool {
-    a.row.iter().zip(&b.row).any(|(&x, &y)| steps_on(x) && steps_on(y))
-}
-
 /// Arrows stepped on in a row. A row with any is a note.
 fn arrows(row: &[Note; 4]) -> usize {
     row.iter().filter(|&&note| steps_on(note)).count()
@@ -562,115 +308,10 @@ fn steps_on(note: Note) -> bool {
     matches!(note, Note::Tap | Note::HoldStart | Note::RollStart)
 }
 
-/// Returns the beats of the first and last non-empty rows, or None for an empty chart.
-fn count_notes_and_rhythms(measures: &[Measure], stats: &mut ChartStatistics) -> Option<(f64, f64)> {
-    // Subdivision -> number of measures
-    let mut sub_div_measures: BTreeMap<usize, usize> = BTreeMap::new();
-    // (measure index, beat) of the first and last non-empty rows
-    let mut first_used: Option<(usize, f64)> = None;
-    let mut last_used = (0, 0.0);
-    let mut measure_start = 0;
-
-    for (m, measure) in measures.iter().enumerate() {
-        let mut sub_div = None;
-        for (r, row) in measure.rows.iter().enumerate() {
-            if row.iter().all(|&note| note == Note::Empty) {
-                continue;
-            }
-            let beat = row_beat(measure_start, measure, r);
-            first_used.get_or_insert((m, beat));
-            last_used = (m, beat);
-
-            for note in row {
-                match note {
-                    Note::HoldStart => stats.num_holds += 1,
-                    Note::RollStart => stats.num_rolls += 1,
-                    Note::Mine => stats.num_mines += 1,
-                    Note::Tap | Note::End | Note::Empty => {}
-                }
-            }
-            let arrows = arrows(row);
-            if arrows == 0 {
-                continue;
-            }
-            stats.num_notes += 1;
-            if arrows >= 2 {
-                stats.num_jumps += 1;
-            }
-            let row_sub_div = row_sub_div(measure, r);
-            sub_div = Some(sub_div.map_or(row_sub_div, |s| lcm(s, row_sub_div)));
-        }
-        if let Some(s) = sub_div {
-            *sub_div_measures.entry(s).or_default() += 1;
-        }
-        measure_start += measure.num_beats;
-    }
-
-    stats.chart_num_measures = first_used.map_or(0, |(first, _)| last_used.0 - first + 1);
-    stats.num_sub_divs = sub_div_measures.len();
-    // `max_by_key` keeps the last maximum, so `rev` sends ties to the smallest.
-    stats.mode_sub_div = sub_div_measures
-        .iter()
-        .rev()
-        .max_by_key(|&(_, &count)| count)
-        .map_or(0, |(&s, _)| s);
-    stats.num_adv_sub_divs = sub_div_measures
-        .iter()
-        .filter(|&(&s, _)| !s.is_power_of_two())
-        .map(|(_, &count)| count)
-        .sum();
-
-    first_used.map(|(_, first_beat)| (first_beat, last_used.1))
-}
-
-/// `span`: beats of the first and last objects, from `count_notes_and_rhythms`. Stops don't
-/// count toward any BPM's time.
-fn count_bpms(timing: &Timing, span: Option<(f64, f64)>, stats: &mut ChartStatistics) {
-    let Some((start, end)) = span else { return };
-
-    // (BPM, total seconds)
-    let mut seconds_at: Vec<(f64, f64)> = Vec::new();
-    let mut previous_bpm = None;
-    for (bpm, beats) in timing.bpm_stretches(start, end) {
-        if previous_bpm.is_some_and(|previous| previous != bpm) {
-            stats.num_bpm_changes += 1;
-        }
-        previous_bpm = Some(bpm);
-
-        let seconds = beats * 60.0 / bpm;
-        match seconds_at.iter_mut().find(|(b, _)| *b == bpm) {
-            Some((_, total)) => *total += seconds,
-            None => seconds_at.push((bpm, seconds)),
-        }
-    }
-
-    stats.mode_bpm = match seconds_at.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.total_cmp(&a.0))) {
-        Some(&(bpm, _)) => bpm,
-        // Everything is on one beat, so no time at any BPM: use the one in effect there.
-        None => timing.bpm_at(start),
-    };
-}
-
 fn row_beat(measure_start: usize, measure: &Measure, row: usize) -> f64 {
     // One division of integers, so equal beats give identical f64s (`Timing::new` relies on it).
     let rows = measure.rows.len();
     (measure_start * rows + row * measure.num_beats) as f64 / rows as f64
-}
-
-/// The row's subdivision, as in "16th notes": 4 on a beat, 8 halfway between two, 12 a third of
-/// the way, and so on.
-fn row_sub_div(measure: &Measure, row: usize) -> usize {
-    // Denominator of `row * num_beats / rows` in lowest terms, times 4 (a beat is a quarter note)
-    let rows = measure.rows.len();
-    4 * (rows / gcd(row * measure.num_beats, rows))
-}
-
-fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 { a } else { gcd(b, a % b) }
-}
-
-fn lcm(a: usize, b: usize) -> usize {
-    a / gcd(a, b) * b
 }
 
 /// Not yet implemented.
@@ -691,12 +332,12 @@ mod tests {
 
     /// Loads a file in `test_resources/`. The `*_stats.sm` fixtures come from
     /// `make_test_simfiles.py`, and each one's header comment tabulates the expected values.
-    fn load(file: &str) -> SimFile {
+    pub(super) fn load(file: &str) -> SimFile {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources").join(file);
         SimFile::from_file(&path).unwrap_or_else(|e| panic!("failed to load {}: {e}", path.display()))
     }
 
-    fn single(sim: &SimFile, difficulty: ChartDifficulty) -> &SingleChart {
+    pub(super) fn single(sim: &SimFile, difficulty: ChartDifficulty) -> &SingleChart {
         sim.step_charts
             .iter()
             .find_map(|chart| match chart {
@@ -706,93 +347,13 @@ mod tests {
             .unwrap_or_else(|| panic!("no dance-single {difficulty:?} chart"))
     }
 
-    fn stats(file: &str, difficulty: ChartDifficulty) -> ChartStatistics {
+    pub(super) fn stats(file: &str, difficulty: ChartDifficulty) -> ChartStatistics {
         let sim = load(file);
         analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops, &COSTS)
     }
 
-    fn assert_close(actual: f64, expected: f64, what: &str) {
+    pub(super) fn assert_close(actual: f64, expected: f64, what: &str) {
         assert!((actual - expected).abs() < 1e-9, "{what}: expected {expected}, got {actual}");
-    }
-
-    #[test]
-    fn finds_each_rows_subdivision() {
-        // (rows in the measure, row index, subdivision)
-        let cases = [
-            (4, 0, 4),
-            (4, 3, 4),
-            (8, 1, 8),
-            (8, 2, 4),
-            (12, 1, 12),
-            (12, 2, 12),
-            (12, 3, 4),
-            (16, 2, 8),
-            (16, 3, 16),
-            (24, 1, 24),
-            (24, 3, 8),
-            (32, 25, 32),
-            (48, 21, 16),
-            (48, 28, 12),
-            (192, 1, 192),
-            (192, 48, 4),
-            // Sizes StepMania doesn't write, but other editors might
-            (6, 1, 12),
-            (20, 1, 20),
-        ];
-        for (rows, row, expected) in cases {
-            let measure = Measure { num_beats: 4, rows: vec![[Note::Empty; 4]; rows] };
-            assert_eq!(row_sub_div(&measure, row), expected, "row {row} of a {rows}-row measure");
-        }
-    }
-
-    #[test]
-    fn counts_notes_and_rhythms() {
-        // (difficulty, (notes, jumps, holds, rolls, mines), (measures, subdivs, mode, advanced))
-        let expected = [
-            (Beginner, (0, 0, 0, 0, 0), (0, 0, 0, 0)),
-            (Easy, (14, 5, 4, 1, 3), (9, 1, 4, 0)),
-            (Medium, (24, 0, 0, 0, 0), (2, 2, 8, 0)),
-            (Hard, (83, 0, 1, 0, 3), (13, 6, 4, 3)),
-            (Challenge, (55, 7, 3, 1, 2), (11, 4, 8, 1)),
-        ];
-        for (difficulty, counts, rhythms) in expected {
-            let s = stats("chart_stats.sm", difficulty);
-            assert_eq!(
-                (s.num_notes, s.num_jumps, s.num_holds, s.num_rolls, s.num_mines),
-                counts,
-                "{difficulty:?}: (notes, jumps, holds, rolls, mines)"
-            );
-            assert_eq!(
-                (s.chart_num_measures, s.num_sub_divs, s.mode_sub_div, s.num_adv_sub_divs),
-                rhythms,
-                "{difficulty:?}: (measures, subdivs, mode, advanced)"
-            );
-        }
-    }
-
-    #[test]
-    fn counts_bpms() {
-        // (file, difficulty, mode BPM, BPM changes)
-        let expected = [
-            ("chart_stats.sm", Beginner, 0.0, 0),
-            ("chart_stats.sm", Easy, 120.0, 0),
-            ("chart_stats.sm", Medium, 120.0, 0),
-            ("chart_stats.sm", Hard, 120.0, 0),
-            ("chart_stats.sm", Challenge, 120.0, 0),
-            ("bpm_stats.sm", Beginner, 0.0, 0),
-            ("bpm_stats.sm", Easy, 240.0, 0),
-            ("bpm_stats.sm", Medium, 120.0, 1),
-            ("bpm_stats.sm", Hard, 120.0, 3),
-            ("bpm_stats.sm", Challenge, 120.0, 3),
-        ];
-        for (file, difficulty, mode_bpm, changes) in expected {
-            let s = stats(file, difficulty);
-            assert_eq!(
-                (s.mode_bpm, s.num_bpm_changes),
-                (mode_bpm, changes),
-                "{file} {difficulty:?}: (mode BPM, BPM changes)"
-            );
-        }
     }
 
     #[test]
@@ -824,33 +385,6 @@ mod tests {
         // A hold from beat 9 to 11. Its end alone isn't a note.
         assert_eq!(notes[8].row, [Note::HoldStart, Note::Empty, Note::Empty, Note::Empty]);
         assert_eq!(notes[8].hold_ends, [Some(6.0), None, None, None]);
-    }
-
-    #[test]
-    fn finds_the_mean_median_and_max() {
-        assert_eq!(mean_median_max(vec![]), (0.0, 0.0, 0.0));
-        assert_eq!(mean_median_max(vec![3.0]), (3.0, 3.0, 3.0));
-        assert_eq!(mean_median_max(vec![5.0, 1.0, 3.0]), (3.0, 3.0, 5.0));
-        // Even count: the median is the mean of the middle two
-        assert_eq!(mean_median_max(vec![4.0, 1.0, 2.0, 9.0]), (4.0, 3.0, 9.0));
-    }
-
-    #[test]
-    fn counts_notes_per_second() {
-        // (difficulty, mean, median, max)
-        let expected = [
-            (Beginner, 0.0, 0.0, 0.0),
-            (Easy, 24.0 / 13.0, 2.0, 3.0),
-            (Medium, 1.0, 1.0, 1.0),
-            (Hard, 81.0 / 16.0, 6.0, 6.0),
-            (Challenge, 98.0 / 23.0, 4.0, 8.0),
-        ];
-        for (difficulty, mean, median, max) in expected {
-            let s = stats("nps_stats.sm", difficulty);
-            assert_close(s.mean_notes_per_second, mean, &format!("{difficulty:?} mean"));
-            assert_close(s.median_notes_per_second, median, &format!("{difficulty:?} median"));
-            assert_close(s.max_notes_per_second, max, &format!("{difficulty:?} max"));
-        }
     }
 
     #[test]
@@ -915,15 +449,10 @@ mod tests {
 
     #[test]
     fn splits_notes_into_segments() {
-        let sim = load("pattern_stats.sm");
+        let sim = load("footing_stats.sm");
         let timing = Timing::new(&sim.bpms, &sim.stops);
-        let expected: [(ChartDifficulty, &[usize]); 5] = [
-            (Beginner, &[]),
-            (Easy, &[5, 9, 2]),
-            (Medium, &[7, 8, 19, 1]),
-            (Hard, &[20]),
-            (Challenge, &[1, 1, 1, 1, 16, 6, 1]),
-        ];
+        let expected: [(ChartDifficulty, &[usize]); 5] =
+            [(Beginner, &[]), (Easy, &[5, 1]), (Medium, &[3, 3]), (Hard, &[4, 4]), (Challenge, &[6, 4, 6])];
         for (difficulty, lengths) in expected {
             let notes = to_timed_notes(&single(&sim, difficulty).measures, &timing);
             let segments = segments(&notes, SEGMENT_BREAK_SECONDS);
@@ -932,112 +461,74 @@ mod tests {
         }
     }
 
+    /// Checks a technique's count and its speeds' (mean, median, max).
+    fn assert_speeds(s: &ChartStatistics, technique: Technique, count: usize, speeds: (f64, f64, f64), chart: ChartDifficulty) {
+        let found = s.technique(technique);
+        let what = format!("{chart:?} {}", technique.plural());
+        assert_eq!(found.count, count, "{what}");
+        assert_close(found.mean_speed, speeds.0, &format!("{what}: mean speed"));
+        assert_close(found.median_speed, speeds.1, &format!("{what}: median speed"));
+        assert_close(found.max_speed, speeds.2, &format!("{what}: max speed"));
+    }
+
     #[test]
-    fn counts_jacks() {
-        // (difficulty, jacks, jacks per second: mean, median, max)
+    fn finds_repeated_arrows_and_jumps() {
+        // (difficulty, repeated arrows, jumps), each (count, speeds: (mean, median, max))
+        let none = (0, (0.0, 0.0, 0.0));
         let expected = [
-            (Beginner, 0, 0.0, 0.0, 0.0),
-            (Easy, 8, 19.0 / 8.0, 2.0, 5.0),
-            (Medium, 0, 0.0, 0.0, 0.0),
-            (Hard, 10, 34.0 / 10.0, 3.0, 7.0),
-            (Challenge, 4, 5.0 / 4.0, 1.0, 2.0),
+            (Beginner, none, none),
+            (Easy, (10, (91.0 / 15.0, 8.0, 8.0)), (2, (6.0, 6.0, 8.0))),
+            (Medium, none, none),
+            (Hard, (10, (6.8, 8.0, 8.0)), (4, (5.0, 4.0, 8.0))),
+            (Challenge, (9, (296.0 / 81.0, 2.0, 8.0)), (4, (85.0 / 18.0, 5.0, 8.0))),
         ];
-        for (difficulty, jacks, mean, median, max) in expected {
+        for (difficulty, repeats, jumps) in expected {
             let s = stats("pattern_stats.sm", difficulty);
-            assert_eq!(s.num_jacks, jacks, "{difficulty:?} jacks");
-            assert_close(s.mean_jacks_per_second, mean, &format!("{difficulty:?} mean jacks per second"));
-            assert_close(s.median_jacks_per_second, median, &format!("{difficulty:?} median jacks per second"));
-            assert_close(s.max_jacks_per_second, max, &format!("{difficulty:?} max jacks per second"));
+            assert_speeds(&s, Technique::RepeatedArrow, repeats.0, repeats.1, difficulty);
+            assert_speeds(&s, Technique::Jump, jumps.0, jumps.1, difficulty);
         }
     }
 
     #[test]
-    fn counts_streams() {
-        // (difficulty, streams, stream length: mean, median, max)
+    fn finds_streams() {
+        // (difficulty, streams, their notes, lengths: (mean, median, max), speeds: (mean, median, max))
         let expected = [
-            (Beginner, 0, 0.0, 0.0, 0.0),
-            (Easy, 1, 9.0, 9.0, 9.0),
-            (Medium, 2, 13.5, 13.5, 19.0),
-            (Hard, 1, 20.0, 20.0, 20.0),
-            (Challenge, 1, 16.0, 16.0, 16.0),
+            (Beginner, 0, 0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+            (Easy, 0, 0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+            (Medium, 2, 24, (12.0, 12.0, 16.0), (6.0, 6.0, 8.0)),
+            (Hard, 1, 17, (17.0, 17.0, 17.0), (8.0, 8.0, 8.0)),
+            (Challenge, 1, 16, (16.0, 16.0, 16.0), (4.0, 4.0, 4.0)),
         ];
-        for (difficulty, streams, mean, median, max) in expected {
+        for (difficulty, streams, notes, lengths, speeds) in expected {
             let s = stats("pattern_stats.sm", difficulty);
-            assert_eq!(s.num_streams, streams, "{difficulty:?} streams");
-            assert_close(s.mean_stream_len, mean, &format!("{difficulty:?} mean stream length"));
-            assert_close(s.median_stream_len, median, &format!("{difficulty:?} median stream length"));
-            assert_close(s.max_stream_len, max, &format!("{difficulty:?} max stream length"));
+            assert_speeds(&s, Technique::Stream, streams, speeds, difficulty);
+            let found = s.technique(Technique::Stream);
+            assert_eq!(found.notes, notes, "{difficulty:?}: notes in streams");
+            assert_close(found.mean_length, lengths.0, &format!("{difficulty:?} mean stream length"));
+            assert_close(found.median_length, lengths.1, &format!("{difficulty:?} median stream length"));
+            assert_close(found.max_length, lengths.2, &format!("{difficulty:?} max stream length"));
         }
     }
 
     #[test]
-    fn measures_duration_and_activity() {
-        // (difficulty, duration, active ratio)
-        let expected = [
-            (Beginner, 0.0, 0.0),
-            (Easy, 7.0, 1.0 / 2.0),
-            (Medium, 3.5, 4.0 / 7.0),
-            (Hard, 2.75, 6.0 / 11.0),
-            (Challenge, 6.0, 7.0 / 12.0),
+    fn finds_the_footings_events_and_patterns() {
+        // (difficulty, the techniques found on its footing: (technique, count, each one's speed))
+        let expected: [(ChartDifficulty, &[(Technique, usize, f64)]); 5] = [
+            (Beginner, &[]),
+            (Easy, &[(Technique::Staircase, 1, 2.0)]),
+            (Medium, &[(Technique::Doublestep, 2, 2.0)]),
+            (Hard, &[]),
+            (Challenge, &[(Technique::Doublestep, 2, 4.0), (Technique::Bracket, 1, 4.0), (Technique::Gallop, 1, 4.0)]),
         ];
-        for (difficulty, duration, active) in expected {
+        for (difficulty, found) in expected {
             let s = stats("footing_stats.sm", difficulty);
-            assert_close(s.chart_dur, duration, &format!("{difficulty:?} duration"));
-            assert_close(s.chart_active_ratio, active, &format!("{difficulty:?} active ratio"));
-        }
-    }
-
-    #[test]
-    fn counts_the_footing() {
-        // (difficulty, [same-foot jacks, vertical footswitches, sideswitches, horizontal
-        // crossovers, vertical crossovers, doublesteps, brackets, freeze switches, laterals, half
-        // spins, full spins], [staircases, drills, drill notes, gallops, triples])
-        let expected = [
-            (Beginner, [0; 11], [0; 5]),
-            // A staircase
-            (Easy, [0; 11], [1, 0, 0, 0, 0]),
-            // 2 doublesteps
-            (Medium, [0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0], [0; 5]),
-            (Hard, [0; 11], [0; 5]),
-            // 2 doublesteps and a bracket
-            (Challenge, [0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0], [0; 5]),
-        ];
-        for (difficulty, events, patterns) in expected {
-            let s = stats("footing_stats.sm", difficulty);
-            let counted = [
-                s.num_same_foot_jacks,
-                s.num_vertical_footswitches,
-                s.num_sideswitches,
-                s.num_horizontal_crossovers,
-                s.num_vertical_crossovers,
-                s.num_doublesteps,
-                s.num_brackets,
-                s.num_freeze_switches,
-                s.num_laterals,
-                s.num_half_spins,
-                s.num_full_spins,
-            ];
-            assert_eq!(counted, events, "{difficulty:?}: events");
-            let found = [s.num_staircases, s.num_drills, s.num_drill_notes, s.num_gallops, s.num_triples];
-            assert_eq!(found, patterns, "{difficulty:?}: patterns");
-        }
-    }
-
-    #[test]
-    fn features_cover_every_statistic() {
-        // A different value in every field, to catch a feature reading the wrong one
-        let names: Vec<String> =
-            serde_json::to_value(ChartStatistics::default()).unwrap().as_object().unwrap().keys().cloned().collect();
-        let values: serde_json::Map<String, serde_json::Value> =
-            names.iter().enumerate().map(|(i, name)| (name.clone(), serde_json::json!(i + 1))).collect();
-        let stats: ChartStatistics = serde_json::from_value(serde_json::Value::Object(values.clone())).unwrap();
-
-        let features = stats.features();
-        let mut feature_names: Vec<String> = features.iter().map(|(name, _)| name.to_string()).collect();
-        feature_names.sort();
-        assert_eq!(feature_names, names, "features() and ChartStatistics have different fields");
-        for (name, value) in features {
-            assert_eq!(Some(value), values[name].as_f64(), "feature {name}");
+            for technique in Technique::ALL.into_iter().filter(|technique| technique.source() != Source::Notes) {
+                let (count, speed) = found
+                    .iter()
+                    .find(|(expected, ..)| *expected == technique)
+                    .map_or((0, 0.0), |&(_, count, speed)| (count, speed));
+                assert_speeds(&s, technique, count, (speed, speed, speed), difficulty);
+            }
         }
     }
 }

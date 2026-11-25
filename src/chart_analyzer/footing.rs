@@ -15,9 +15,10 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::ops::AddAssign;
 
+use super::technique::{Occurrence, Technique, gaps};
 use super::{TIME_EPSILON, TimedNote, steps_on};
-use patterns::Patterns;
 
+pub mod moves;
 pub mod patterns;
 
 const LEFT_ARROW: usize = 0;
@@ -368,6 +369,23 @@ impl AddAssign for Events {
 }
 
 impl Events {
+    /// How many of each technique.
+    pub fn counts(&self) -> [(Technique, usize); 11] {
+        [
+            (Technique::Jack, self.jacks),
+            (Technique::VerticalFootswitch, self.vertical_footswitches),
+            (Technique::Sideswitch, self.sideswitches),
+            (Technique::HorizontalCrossover, self.footing.horizontal_crossovers),
+            (Technique::VerticalCrossover, self.vertical_crossovers),
+            (Technique::Doublestep, self.doublesteps),
+            (Technique::Bracket, self.brackets),
+            (Technique::FreezeSwitch, self.freeze_switches),
+            (Technique::Lateral, self.footing.laterals),
+            (Technique::HalfSpin, self.footing.half_spins),
+            (Technique::FullSpin, self.footing.full_spins),
+        ]
+    }
+
     /// The events added since `earlier`.
     fn since(&self, earlier: &Events) -> Events {
         Events {
@@ -405,11 +423,7 @@ impl Events {
 
     /// `cost` of events added at note `i` of `segment`.
     fn cost_at(&self, costs: &Costs, segment: &[TimedNote], i: usize) -> u64 {
-        let gap = |later: usize| match (later.checked_sub(1).and_then(|before| segment.get(before)), segment.get(later)) {
-            (Some(before), Some(later)) => later.time - before.time,
-            _ => f64::INFINITY,
-        };
-        let (before, after) = (gap(i), gap(i + 1));
+        let (before, after) = gaps(segment, i);
         self.cost(costs, costs.speed(before), costs.speed(before.min(after)))
     }
 }
@@ -480,15 +494,16 @@ impl Step {
 pub struct Solution {
     /// One per note
     pub steps: Vec<Step>,
-    /// What each step adds to `events`. A spin is counted where its turn ends: the note that
-    /// turns back, or the last.
-    pub step_events: Vec<Events>,
+    /// Each event, on the note whose step adds it, and each pattern, on its first note, in note
+    /// order. A spin is where its turn ends: the note that turns back, or the last.
+    pub occurrences: Vec<Occurrence>,
     pub events: Events,
-    /// The patterns starting at each note
-    pub step_patterns: Vec<Patterns>,
-    pub patterns: Patterns,
     /// The events' penalties, each at its speed
     pub cost: f64,
+    /// One per note: the penalties of the events its step adds. They add up to `cost`.
+    pub note_costs: Vec<f64>,
+    /// Each foot's steps after its first
+    pub moves: Vec<moves::Move>,
     /// Branches tried
     pub nodes: u64,
     /// Branches that reached a position another had reached
@@ -497,6 +512,23 @@ pub struct Solution {
     pub widest: usize,
     /// False if branches were dropped: `steps` may not be the cheapest
     pub exact: bool,
+}
+
+impl Solution {
+    /// What is found on note `note`.
+    pub fn at(&self, note: usize) -> impl Iterator<Item = &Occurrence> {
+        self.occurrences.iter().filter(move |occurrence| occurrence.note == note)
+    }
+
+    #[cfg(test)]
+    pub fn of(&self, technique: Technique) -> impl Iterator<Item = &Occurrence> {
+        self.occurrences.iter().filter(move |occurrence| occurrence.technique == technique)
+    }
+
+    #[cfg(test)]
+    pub fn count(&self, technique: Technique) -> usize {
+        self.of(technique).count()
+    }
 }
 
 /// All that the rest of a segment depends on.
@@ -803,43 +835,82 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
         index = parent;
     }
     steps.reverse();
-    let step_events = step_events(segment, &steps, &events);
-    let step_patterns = patterns::find(segment, &steps, &step_events);
-    let mut found = Patterns::default();
-    for &patterns in &step_patterns {
-        found += patterns;
+    let (step_events, kinds) = replay(segment, &steps, &events);
+    let mut occurrences: Vec<Occurrence> = Vec::new();
+    for (i, added) in step_events.iter().enumerate() {
+        for (technique, count) in added.counts() {
+            occurrences.extend((0..count).map(|_| Occurrence::at(technique, segment, i)));
+        }
     }
-    let cost = cost as f64 / COST_UNIT;
-    Solution { steps, step_events, events, step_patterns, patterns: found, cost, nodes, merged, widest, exact }
+    occurrences.extend(kinds.into_iter().map(|(i, kind)| Occurrence::at(kind, segment, i)));
+    occurrences.extend(patterns::find(segment, &steps, &step_events));
+    // Stable: a note's events stay before their kinds, and those before its patterns
+    occurrences.sort_by_key(|occurrence| occurrence.note);
+    let note_costs: Vec<u64> = step_events.iter().enumerate().map(|(i, added)| added.cost_at(costs, segment, i)).collect();
+    debug_assert_eq!(note_costs.iter().sum::<u64>(), cost);
+    let in_points = |cost: u64| cost as f64 / COST_UNIT;
+    let note_costs = note_costs.into_iter().map(in_points).collect();
+    let moves = moves::find(segment, &steps);
+    Solution { steps, occurrences, events, cost: in_points(cost), note_costs, moves, nodes, merged, widest, exact }
 }
 
-/// Replays `steps` for what each adds. `total`: the events once the last turn has ended.
-fn step_events(segment: &[TimedNote], steps: &[Step], total: &Events) -> Vec<Events> {
+/// Replays `steps` for the events each adds, and for which kind each vertical footswitch and
+/// horizontal crossover is (see `Technique::kinds`), as (note, kind). `total`: the events once
+/// the last turn has ended.
+fn replay(segment: &[TimedNote], steps: &[Step], total: &Events) -> (Vec<Events>, Vec<(usize, Technique)>) {
     let mut state = State::home();
-    let mut added = Vec::with_capacity(steps.len());
+    // Per foot: the arrows it is on or was last on, and those it came there from
+    let (mut stands, mut came_from) = (state.on, state.on);
+    let (mut added, mut kinds) = (Vec::with_capacity(steps.len()), Vec::new());
     for (i, step) in steps.iter().enumerate() {
         let (_, next) = uncosted_options(segment, i, &state)
             .into_iter()
             .find(|(option, _)| option == step)
             .expect("a step is one of its note's options");
-        added.push(next.events.since(&state.events));
+        for foot in 0..2 {
+            if next.on[foot] != 0 && next.on[foot] != stands[foot] {
+                (came_from[foot], stands[foot]) = (stands[foot], next.on[foot]);
+            }
+        }
+        let events = next.events.since(&state.events);
+        // A footswitch: the arrow the other foot was on, repeated
+        let switched = |arrow: usize| {
+            let repeated = segment[i].steps(arrow) && i > 0 && segment[i - 1].steps(arrow);
+            repeated && step.foot(arrow).is_some_and(|foot| has(state.on[foot.other() as usize], arrow))
+        };
+        let footswitches = [(UP_ARROW, Technique::UpFootswitch), (DOWN_ARROW, Technique::DownFootswitch)];
+        let before = kinds.len();
+        kinds.extend(footswitches.into_iter().filter(|&(arrow, _)| switched(arrow)).map(|(_, kind)| (i, kind)));
+        debug_assert_eq!(kinds.len() - before, events.vertical_footswitches);
+        if events.footing.horizontal_crossovers > 0 {
+            // The foot across the pad: the left on Right, or else the right on Left
+            let (crossing, home) = if has(next.on[Foot::Left as usize], RIGHT_ARROW) {
+                (Foot::Left, LEFT_ARROW)
+            } else {
+                (Foot::Right, RIGHT_ARROW)
+            };
+            let from_home = has(came_from[crossing as usize], home);
+            kinds.push((i, if from_home { Technique::FullCrossover } else { Technique::HalfCrossover }));
+        }
+        added.push(events);
         state = next;
     }
     if let Some(last) = added.last_mut() {
         *last += total.since(&state.events);
     }
-    added
+    (added, kinds)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::chart_analyzer::technique::Source;
     use crate::chart_analyzer::{Timing, to_timed_notes};
     use crate::sim_loader::{BPMChange, Measure, Note};
 
     /// A segment from tokens 0.125 s apart, one row each: `L`, `D`, `U`, `R` for taps (`LR` is a
     /// jump), a trailing `+` for hold heads, a trailing `-` for hold ends, `.` for an empty row.
-    pub(super) fn segment(tokens: &str) -> Vec<TimedNote> {
+    pub(in crate::chart_analyzer) fn segment(tokens: &str) -> Vec<TimedNote> {
         let measures: Vec<Measure> = tokens
             .split_whitespace()
             .map(|token| {
@@ -977,16 +1048,29 @@ mod tests {
     }
 
     fn solved(tokens: &str, costs: &Costs) -> (String, Events) {
-        let solution = solve(&segment(tokens), costs, WIDTH);
+        let notes = segment(tokens);
+        let solution = solve(&notes, costs, WIDTH);
         assert!(solution.exact, "{tokens}: branches dropped");
         // `segment` spaces notes at the reference gap
         assert_eq!(solution.cost, solution.events.cost(costs, 1.0, 1.0) as f64 / COST_UNIT, "{tokens}: cost");
         let mut added = Events::default();
-        for &events in &solution.step_events {
+        for events in replay(&notes, &solution.steps, &solution.events).0 {
             added += events;
         }
         assert_eq!(added, solution.events, "{tokens}: events step by step");
+        for (technique, count) in solution.events.counts() {
+            assert_eq!(solution.count(technique), count, "{tokens}: {} found", technique.plural());
+        }
         (feet(&solution), solution.events)
+    }
+
+    /// The events on note `note`, with their speeds.
+    fn found_on(solution: &Solution, note: usize) -> Vec<(Technique, f64)> {
+        solution
+            .at(note)
+            .filter(|occurrence| occurrence.technique.source() == Source::FootingEvent)
+            .map(|occurrence| (occurrence.technique, occurrence.speed))
+            .collect()
     }
 
     #[test]
@@ -1118,14 +1202,106 @@ mod tests {
 
     #[test]
     fn says_which_step_each_event_is_on() {
+        // Notes 0.125 s apart: 8 a second
         let crossover = solve(&segment("L D R D L"), &COSTS, WIDTH);
-        let on_right = [Events::default(), Events::default(), events(0, 0, 1, 0, 0, 0, 0), Events::default(), Events::default()];
-        assert_eq!(crossover.step_events, on_right);
+        let on_right = |technique| Occurrence { technique, note: 2, notes: 1, speed: 8.0 };
+        assert_eq!(crossover.occurrences, [on_right(Technique::HorizontalCrossover), on_right(Technique::FullCrossover)]);
         // The spin is counted on the last note
         let spinner = Costs { doublestep: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
         let spin = solve(&segment("L D R U L D"), &spinner, WIDTH);
-        assert_eq!(spin.step_events[2], events(0, 0, 1, 0, 0, 0, 0));
-        assert_eq!(spin.step_events[5], candled(1, events(0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(found_on(&spin, 2), [(Technique::HorizontalCrossover, 8.0), (Technique::FullCrossover, 8.0)]);
+        assert_eq!(found_on(&spin, 5), [(Technique::VerticalCrossover, 8.0), (Technique::FullSpin, 8.0)]);
+    }
+
+    #[test]
+    fn tells_up_footswitches_from_down() {
+        let no_jacks = Costs { jack: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
+        let kinds = |tokens: &str, costs: &Costs| {
+            let solution = solve(&segment(tokens), costs, WIDTH);
+            let kinds: Vec<(usize, Technique)> = solution
+                .occurrences
+                .iter()
+                .filter(|found| Technique::VerticalFootswitch.kinds().contains(&found.technique))
+                .map(|found| (found.note, found.technique))
+                .collect();
+            assert_eq!(kinds.len(), solution.count(Technique::VerticalFootswitch), "{tokens}: each footswitch has a kind");
+            kinds
+        };
+        assert_eq!(kinds("L D D R", &COSTS), [(2, Technique::DownFootswitch)]);
+        assert_eq!(kinds("U U", &no_jacks), [(1, Technique::UpFootswitch)]);
+        assert_eq!(kinds("D D D", &no_jacks), [(1, Technique::DownFootswitch), (2, Technique::DownFootswitch)]);
+        // Only the foot on Up switches
+        assert_eq!(kinds("LU UR", &COSTS), [(1, Technique::UpFootswitch)]);
+        // A sideswitch is neither, nor is a jack
+        assert_eq!(kinds("L L", &no_jacks), []);
+        assert_eq!(kinds("U U", &COSTS), []);
+        // Timed as the footswitch it is
+        let switched = solve(&segment("L D . D R"), &COSTS, WIDTH);
+        assert_eq!(found_on(&switched, 2), [(Technique::VerticalFootswitch, 4.0), (Technique::DownFootswitch, 4.0)]);
+    }
+
+    #[test]
+    fn tells_full_crossovers_from_half() {
+        let costs = Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
+        let kinds = |tokens: &str| {
+            let solution = solve(&segment(tokens), &costs, WIDTH);
+            let kinds: Vec<(usize, Technique)> = Technique::HorizontalCrossover
+                .kinds()
+                .iter()
+                .flat_map(|&kind| solution.of(kind).map(move |found| (found.note, kind)))
+                .collect();
+            assert_eq!(kinds.len(), solution.count(Technique::HorizontalCrossover), "{tokens}: each crossover has a kind");
+            (feet(&solution), kinds)
+        };
+        // The left foot goes from Left to Right, past the right foot on Down
+        assert_eq!(kinds("L D R D L"), ("lrlrl".into(), vec![(2, Technique::FullCrossover)]));
+        // From Up to Right: it was already beside the right foot
+        assert_eq!(kinds("L R U D R"), ("lrlrl".into(), vec![(4, Technique::HalfCrossover)]));
+        // Mirrored
+        assert_eq!(kinds("R D L D R"), ("rlrlr".into(), vec![(2, Technique::FullCrossover)]));
+        assert_eq!(kinds("R L U D L"), ("rlrlr".into(), vec![(4, Technique::HalfCrossover)]));
+        // Uncrossed, then across again from the arrow it uncrossed to
+        assert_eq!(kinds("L D R D L D R"), ("lrlrlrl".into(), vec![(2, Technique::FullCrossover), (6, Technique::FullCrossover)]));
+        // The right foot starts on Left, straight from home. It's a crossover once the left foot
+        // is on Down.
+        assert_eq!(kinds("L D R D U D R"), ("rlrlrlr".into(), vec![(1, Technique::FullCrossover)]));
+    }
+
+    #[test]
+    fn times_each_event() {
+        // The crossover onto Right: 0.25 s after Down, 0.125 s before the next. A position goes
+        // by the shorter gap.
+        let costs = Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
+        let crossover = solve(&segment("L D . R D L"), &costs, WIDTH);
+        assert_eq!(found_on(&crossover, 2), [(Technique::HorizontalCrossover, 8.0), (Technique::FullCrossover, 8.0)]);
+        let slow = solve(&segment("L D . R . D L"), &costs, WIDTH);
+        assert_eq!(found_on(&slow, 2), [(Technique::HorizontalCrossover, 4.0), (Technique::FullCrossover, 4.0)]);
+        // A step goes by the gap before it
+        let doublestep = solve(&segment("L . . . D . . . R D"), &COSTS, WIDTH);
+        assert_eq!(found_on(&doublestep, 2), [(Technique::Doublestep, 2.0)]);
+        // A repeated jump: two jacks on one note
+        let jumps = solve(&segment("LR . LR"), &COSTS, WIDTH);
+        assert_eq!(found_on(&jumps, 1), [(Technique::Jack, 4.0), (Technique::Jack, 4.0)]);
+        assert_eq!(jumps.count(Technique::Jack), 2);
+    }
+
+    #[test]
+    fn costs_each_note() {
+        // Slow enough to doublestep onto Right, 0.5 s after Down
+        let doublestep = solve(&segment("L . . . D . . . R"), &COSTS, WIDTH);
+        assert_eq!(feet(&doublestep), "lrr");
+        let cost = COSTS.doublestep.base + COSTS.doublestep.speed * 0.25;
+        assert_eq!(doublestep.note_costs, [0.0, 0.0, cost]);
+        assert_eq!(doublestep.cost, cost);
+        // A repeated jump: both jacks on its note
+        let jumps = solve(&segment("LR . LR"), &COSTS, WIDTH);
+        assert_eq!(jumps.note_costs, [0.0, 2.0 * COSTS.jack.speed * 0.5]);
+        // A spin is paid where its turn ends
+        let spin = solve(&segment("L D R U L D"), &Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS }, WIDTH);
+        assert_eq!(spin.count(Technique::FullSpin), 1);
+        assert_eq!(spin.note_costs.iter().sum::<f64>(), spin.cost);
+        assert_eq!(spin.note_costs.len(), 6);
+        assert!(solve(&[], &COSTS, WIDTH).note_costs.is_empty());
     }
 
     #[test]
@@ -1148,7 +1324,7 @@ mod tests {
         assert_eq!(footing(4.0), ("lrl*r*l*".into(), switched(3, Events::default())));
         let fast = solve(&at_speed("D+ R U R U D-", 4.0), &costs, WIDTH);
         assert_eq!(fast.cost, 3.0 * (costs.freeze_switch.base + costs.freeze_switch.speed * 4.0));
-        assert_eq!(fast.step_events[2], switched(1, Events::default()));
+        assert_eq!(found_on(&fast, 2), [(Technique::FreezeSwitch, 32.0)]);
         assert!(COSTS.freeze_switch.base > COSTS.freeze_switch.speed);
 
         // Never, at a price
@@ -1219,7 +1395,8 @@ mod tests {
         // On a doublestep too: the right foot under the left's hold
         let costs = Costs { bracket: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
         let held = solve(&segment("L+ U D L-"), &costs, WIDTH);
-        assert_eq!((feet(&held), held.step_events[2]), ("lrr".into(), candled(1, events(0, 0, 0, 1, 0, 0, 0))));
+        assert_eq!(feet(&held), "lrr");
+        assert_eq!(found_on(&held, 2), [(Technique::VerticalCrossover, 8.0), (Technique::Doublestep, 8.0)]);
         // Not once the other foot has taken its arrow
         let no_jacks = Costs { jack: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
         assert_eq!(solved("U U D", &no_jacks), ("lrl".into(), events(0, 1, 0, 0, 0, 0, 0)));
@@ -1385,16 +1562,18 @@ mod tests {
     /// For the .sm files under `DDR_SONGS`, tab separated: a `SEG` line per segment (notes, whether
     /// it's exact, branches tried, cost, branches merged, most kept) and a `CHART` line per chart
     /// (title, difficulty, rating, notes, inexact segments, then each event and pattern in the
-    /// order of `Events` and `Patterns`, the positions of `Footing` last among the events).
+    /// order of `Events`, the positions of `Footing` last, then staircases, drills, drill notes,
+    /// gallops and triples).
     #[test]
     #[ignore]
     fn report_songs() {
-        use super::super::{FOOTING_BREAK_SECONDS, segments};
+        use super::super::{SEGMENT_BREAK_SECONDS, segments};
+        const PATTERNS: [Technique; 4] = [Technique::Staircase, Technique::Drill, Technique::Gallop, Technique::Triple];
 
         let max_width = max_width();
         for chart in song_charts() {
-            let (mut events, mut found, mut inexact) = (Events::default(), Patterns::default(), 0);
-            for segment in segments(&chart.notes, FOOTING_BREAK_SECONDS) {
+            let (mut events, mut found, mut drill_notes, mut inexact) = (Events::default(), [0; 4], 0, 0);
+            for segment in segments(&chart.notes, SEGMENT_BREAK_SECONDS) {
                 let solution = solve(segment, &super::COSTS, max_width);
                 println!(
                     "SEG\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -1407,7 +1586,10 @@ mod tests {
                 );
                 inexact += usize::from(!solution.exact);
                 events += solution.events;
-                found += solution.patterns;
+                for (count, technique) in found.iter_mut().zip(PATTERNS) {
+                    *count += solution.count(technique);
+                }
+                drill_notes += solution.of(Technique::Drill).map(|drill| drill.notes).sum::<usize>();
             }
             let counts = [
                 chart.notes.len(),
@@ -1423,11 +1605,11 @@ mod tests {
                 events.footing.laterals,
                 events.footing.half_spins,
                 events.footing.full_spins,
-                found.staircases,
-                found.drills,
-                found.drill_notes,
-                found.gallops,
-                found.triples,
+                found[0],
+                found[1],
+                drill_notes,
+                found[2],
+                found[3],
             ];
             let counts: Vec<String> = counts.iter().map(usize::to_string).collect();
             println!("CHART\t{}\t{}\t{}\t{}", chart.title, chart.difficulty, chart.rating, counts.join("\t"));
@@ -1440,14 +1622,14 @@ mod tests {
     #[test]
     #[ignore]
     fn time_songs() {
-        use super::super::{FOOTING_BREAK_SECONDS, segments};
+        use super::super::{SEGMENT_BREAK_SECONDS, segments};
         use std::time::Instant;
 
         let runs: usize = std::env::var("DDR_RUNS").map_or(5, |runs| runs.parse().expect("a number"));
         let max_width = max_width();
         let charts = song_charts();
         let chart_segments: Vec<Vec<&[TimedNote]>> =
-            charts.iter().map(|chart| segments(&chart.notes, FOOTING_BREAK_SECONDS)).collect();
+            charts.iter().map(|chart| segments(&chart.notes, SEGMENT_BREAK_SECONDS)).collect();
         // [chart][run]
         let mut seconds = vec![Vec::with_capacity(runs); charts.len()];
         let mut nodes = vec![0; charts.len()];
