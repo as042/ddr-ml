@@ -12,6 +12,7 @@ use std::{
 
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::chart_analyzer::{
     COSTS, ChartStatistics, Costs, Foot, FootedSegment, Source, Technique, analyze_singles, foot_arrows, foot_chart,
@@ -26,11 +27,13 @@ use crate::device::DevicePreference;
 use crate::model::ModelConfig;
 use crate::pca::Pca;
 use crate::sim_loader::{SimFile, SingleChart, StepChart};
-use crate::stats_cache::StatsCache;
+use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, TrainedModel, TrainingConfig};
 
 const CACHE_FILE: &str = "artifacts/stats_cache.json";
 const MODEL_DIR: &str = "artifacts/a3_model3/";
+/// In `MODEL_DIR` (see `ModelInputs`).
+const INPUTS_FILE: &str = "inputs.json";
 const PCA_FILE: &str = "artifacts/pca.json";
 /// Puts all 4 [ ]DENTITY charts in the test split.
 const SPLIT_SEED: u64 = 643;
@@ -46,10 +49,69 @@ struct Sample {
     rating: f32,
 }
 
+/// An error if `charts` charts split too small for a tool: fewer than `min_train` to train on,
+/// or none to validate or test on. The trainer and the PCA would panic.
+fn enough_charts(charts: usize, config: &TrainingConfig, min_train: usize) -> Result<(), String> {
+    let (train, val, test) = train::split_rows(charts, config);
+    if train.len() >= min_train && !val.is_empty() && !test.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{charts} charts are too few: they split into {} to train on, {} to validate and {} to test, and it takes {min_train} to train on and some of each",
+        train.len(),
+        val.len(),
+        test.len()
+    ))
+}
+
+/// The statistics a saved model was trained on, saved beside it: the model itself only knows
+/// how many it takes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ModelInputs {
+    /// `ChartStatistics::features`' names, in order
+    features: Vec<String>,
+    /// `analyzer_fingerprint` at the time
+    analyzer: u64,
+}
+
+impl ModelInputs {
+    fn now(features: Vec<String>) -> ModelInputs {
+        ModelInputs { features, analyzer: analyzer_fingerprint() }
+    }
+
+    fn save(&self, dir: &Path) -> Result<(), Box<dyn Error>> {
+        Ok(fs::write(dir.join(INPUTS_FILE), serde_json::to_string_pretty(self)?)?)
+    }
+
+    fn load(dir: &Path) -> Result<ModelInputs, Box<dyn Error>> {
+        Ok(serde_json::from_str(&fs::read_to_string(dir.join(INPUTS_FILE))?)?)
+    }
+
+    /// Whether a model trained on these can take `now`: an error if the statistics differ in
+    /// name, number or order, and a warning if only the analyzer's source does (the same names
+    /// may no longer mean the same).
+    fn check(&self, now: &ModelInputs) -> Result<Option<String>, String> {
+        if self.features != now.features {
+            let differs = self.features.iter().zip(&now.features).position(|(then, now)| then != now);
+            let how = match differs {
+                Some(i) => format!("statistic {} was {}, and is now {}", i + 1, self.features[i], now.features[i]),
+                None => format!("it took {} statistics, and charts now have {}", self.features.len(), now.features.len()),
+            };
+            return Err(format!("the model was trained on other statistics ({how}): train it again"));
+        }
+        let changed = self.analyzer != now.analyzer;
+        Ok(changed.then(|| {
+            "the chart analyzer's source has changed since the model was trained, so its statistics may \
+             not mean what they did: train it again to be sure"
+                .to_string()
+        }))
+    }
+}
+
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
 /// chart in a folder of song folders (the argument, or DDR A3), and saves it to `MODEL_DIR`.
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (_, samples) = cached_samples(&songs_folder(args)?)?;
+    let (feature_names, samples) = cached_samples(&songs_folder(args)?)?;
 
     // Small batches: with only a few hundred charts, they make more steps per epoch.
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
@@ -58,26 +120,28 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     let model_config = ModelConfig::funnel(inputs[0].len(), 1, 2048, 1).with_dropout(0.2);
     let weight_decay = 1.0;
     let input_noise = 0.2;
-    println!(
-        "model: {} (inputs, hidden layers, output), dropout {}, weight decay {weight_decay}, input noise {input_noise}",
-        model_config.shape(),
-        model_config.dropout
-    );
     let training = TrainingConfig::new()
         .with_batch_size(32)
         .with_input_noise(input_noise)
         .with_split_seed(SPLIT_SEED)
         .with_optimizer(AdamWConfig::new().with_weight_decay(weight_decay));
+    enough_charts(samples.len(), &training, training.batch_size)?;
+    say!(
+        "model: {} (inputs, hidden layers, output), dropout {}, weight decay {weight_decay}, input noise {input_noise}",
+        model_config.shape(),
+        model_config.dropout
+    );
     let (trained, test) = model_config.train(&dataset, &training);
     trained.save(&model_config, MODEL_DIR)?;
-    println!("\nsaved the model to {MODEL_DIR}/\n");
+    ModelInputs::now(feature_names).save(Path::new(MODEL_DIR))?;
+    say!("\nsaved the model to {MODEL_DIR}/\n");
 
-    println!("{:<48} {:>6} {:>9}", "test chart", "rating", "predicted");
+    say!("{:<48} {:>6} {:>9}", "test chart", "rating", "predicted");
     for (&row, predicted) in test.rows.iter().zip(&test.predictions).take(EXAMPLES) {
-        println!("{:<48} {:>6} {:>9.2}", samples[row].name, samples[row].rating, predicted[0]);
+        say!("{:<48} {:>6} {:>9.2}", samples[row].name, samples[row].rating, predicted[0]);
     }
     let accuracy = test.metrics[0];
-    println!(
+    say!(
         "\n{SCALE_NOTE}\nover all {} test charts: typically {:.2} levels from the middle of their rating (RMS), at most {:.2}",
         test.rows.len(),
         accuracy.rms_error(),
@@ -93,7 +157,8 @@ pub fn pca(args: &[String]) -> Result<(), Box<dyn Error>> {
     report_pca(&feature_names, &samples)
 }
 
-/// Rates every dance-single chart of each simfile with the model in `MODEL_DIR`.
+/// Rates every dance-single chart of each simfile with the model in `MODEL_DIR`. Refuses if
+/// the model was trained on other statistics than charts have now.
 pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.is_empty() {
         return Err("infer needs a simfile or song folder".into());
@@ -101,35 +166,41 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     let device = DevicePreference::default().device();
     let model = TrainedModel::load(MODEL_DIR, &device)
         .map_err(|e| format!("couldn't load the model in {MODEL_DIR} ({e}): has `train` been run?"))?;
-    println!("{SCALE_NOTE}\n");
+    let trained_on = ModelInputs::load(Path::new(MODEL_DIR))
+        .map_err(|e| format!("the model in {MODEL_DIR} doesn't say which statistics it takes ({e}): train it again"))?;
+    let names = ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect();
+    if let Some(warning) = trained_on.check(&ModelInputs::now(names))? {
+        eprintln!("warning: {warning}");
+    }
+    // A mismatch would broadcast silently
+    if trained_on.features.len() != model.model.num_inputs() {
+        return Err(format!(
+            "the model in {MODEL_DIR} takes {} statistics, but {INPUTS_FILE} lists {}: train it again",
+            model.model.num_inputs(),
+            trained_on.features.len()
+        )
+        .into());
+    }
+    say!("{SCALE_NOTE}\n");
     for path in args {
         let sim = SimFile::from_file(path).map_err(|e| format!("{path}: {e}"))?;
-        println!("{} by {}", sim.title, sim.artist);
-        println!("{:<10} {:>6} {:>9}", "chart", "rating", "predicted");
+        say!("{} by {}", sim.title, sim.artist);
+        say!("{:<10} {:>6} {:>9}", "chart", "rating", "predicted");
         for chart in analyze_singles(&sim) {
             let name = format!("{:?}", chart.difficulty);
             let features = match finite_features(&chart.stats) {
                 Ok(features) => features,
                 Err(feature) => {
-                    println!("{name:<10} {:>6} {:>9}  (its {feature} isn't a finite number)", chart.rating, "-");
+                    say!("{name:<10} {:>6} {:>9}  (its {feature} isn't a finite number)", chart.rating, "-");
                     continue;
                 }
             };
-            // A mismatch would broadcast silently
-            if features.len() != model.model.num_inputs() {
-                return Err(format!(
-                    "the model in {MODEL_DIR} takes {} statistics, but charts now have {}: train it again",
-                    model.model.num_inputs(),
-                    features.len()
-                )
-                .into());
-            }
             let width = features.len();
             let x = Tensor::<2>::from_data(TensorData::new(features, [1, width]), &device);
             let predicted = model.predict(x).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            println!("{name:<10} {:>6} {:>9.2}", chart.rating, predicted[0]);
+            say!("{name:<10} {:>6} {:>9.2}", chart.rating, predicted[0]);
         }
-        println!();
+        say!();
     }
     Ok(())
 }
@@ -176,10 +247,10 @@ pub fn scan_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     let threads = footing_threads();
     let evaluate = |costs: &Costs| cost_fit::score(&charts, &cost_fit::foot_all(&charts, costs, threads).counts);
     let baseline = print_scores("the costs as they are", &charts, &COSTS, threads);
-    println!("{SCORE_KEY}\n");
+    say!("{SCORE_KEY}\n");
 
     let scored = COLUMNS[..SCORED].iter().map(|name| format!("{name:>13}")).collect::<String>();
-    println!("{:<26} {:>8} {:>7} {:>8} {scored}", "one cost changed", "to", "score", "change");
+    say!("{:<26} {:>8} {:>7} {:>8} {scored}", "one cost changed", "to", "score", "change");
     // Per cost: (name, lowest score and its value, highest score)
     let mut ranges = Vec::new();
     for index in 0..COSTS.clone().parameters().len() {
@@ -190,7 +261,7 @@ pub fn scan_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
             *costs.parameters()[index].1 = changed;
             let score = evaluate(&costs);
             let errors = score.errors[..SCORED].iter().map(|error| format!("{error:>13.3}")).collect::<String>();
-            println!("{name:<26} {changed:>8.3} {:>7.4} {:>+8.4} {errors}", score.score, score.score - baseline.score);
+            say!("{name:<26} {changed:>8.3} {:>7.4} {:>+8.4} {errors}", score.score, score.score - baseline.score);
             if score.score < lowest.0 {
                 lowest = (score.score, changed);
             }
@@ -200,9 +271,9 @@ pub fn scan_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     ranges.sort_by(|a, b| a.2.0.total_cmp(&b.2.0));
-    println!("\n{:<26} {:>8} {:>8} {:>7} {:>8} {:>8}", "cost, best first", "now", "best at", "score", "change", "worst");
+    say!("\n{:<26} {:>8} {:>8} {:>7} {:>8} {:>8}", "cost, best first", "now", "best at", "score", "change", "worst");
     for (name, value, (lowest, at), highest) in ranges {
-        println!("{name:<26} {value:>8.3} {at:>8.3} {lowest:>7.4} {:>+8.4} {:>+8.4}", lowest - baseline.score, highest - baseline.score);
+        say!("{name:<26} {value:>8.3} {at:>8.3} {lowest:>7.4} {:>+8.4} {:>+8.4}", lowest - baseline.score, highest - baseline.score);
     }
     Ok(())
 }
@@ -213,11 +284,11 @@ pub fn score_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     let charts = charts_in_sheet(args, "score-costs")?;
     let threads = footing_threads();
     print_scores("the costs as they are", &charts, &COSTS, threads);
-    println!("{SCORE_KEY}");
+    say!("{SCORE_KEY}");
     let (held_out, searched): (Vec<cost_fit::Chart>, Vec<cost_fit::Chart>) = charts.into_iter().partition(is_held_out);
     let score = |charts: &[cost_fit::Chart]| cost_fit::score(charts, &cost_fit::foot_all(charts, &COSTS, threads).counts).score;
-    println!("\nscore on the {} charts fit-costs searches on: {:.4}", searched.len(), score(&searched));
-    println!("score on the {} charts it holds out: {:.4}", held_out.len(), score(&held_out));
+    say!("\nscore on the {} charts fit-costs searches on: {:.4}", searched.len(), score(&searched));
+    say!("score on the {} charts it holds out: {:.4}", held_out.len(), score(&held_out));
     Ok(())
 }
 
@@ -256,7 +327,7 @@ pub fn fit_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     let threads = footing_threads();
     let (held_out, training): (Vec<cost_fit::Chart>, Vec<cost_fit::Chart>) =
         charts.into_iter().partition(is_held_out);
-    println!("searching on {} charts, holding out {} (every {HOLD_OUT_EVERY}th song)", training.len(), held_out.len());
+    say!("searching on {} charts, holding out {} (every {HOLD_OUT_EVERY}th song)", training.len(), held_out.len());
 
     // The search moves each cost in units of its own size
     let mut now = COSTS;
@@ -281,7 +352,7 @@ pub fn fit_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let started = Instant::now();
-    println!("{:>11} {:>7} {:>7} {:>6}", "evaluations", "best", "latest", "step");
+    say!("{:>11} {:>7} {:>7} {:>6}", "evaluations", "best", "latest", "step");
     let found = cma_es::minimize(
         &start,
         FIT_STEP,
@@ -292,23 +363,23 @@ pub fn fit_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
             cost_fit::score(&training, &cost_fit::foot_all(&training, &costs, threads).counts).score + 0.01 * outside
         },
         |generation| {
-            println!("{:>11} {:>7.4} {:>7.4} {:>6.3}", generation.evaluations, generation.best, generation.generation_best, generation.step)
+            say!("{:>11} {:>7.4} {:>7.4} {:>6.3}", generation.evaluations, generation.best, generation.generation_best, generation.step)
         },
     );
     let (best, _) = costs_at(&found.point);
-    println!("\n{} evaluations in {:.0} minutes\n", found.evaluations, started.elapsed().as_secs_f64() / 60.0);
+    say!("\n{} evaluations in {:.0} minutes\n", found.evaluations, started.elapsed().as_secs_f64() / 60.0);
 
     for (charts, which) in [(&training, "searched on"), (&held_out, "held out")] {
         let before = print_scores(&format!("the costs as they are, on the charts {which}"), charts, &COSTS, threads);
         let after = print_scores(&format!("the fitted costs, on the charts {which}"), charts, &best, threads);
-        println!("score {:.4} to {:.4}\n", before.score, after.score);
+        say!("score {:.4} to {:.4}\n", before.score, after.score);
     }
-    println!("{SCORE_KEY}\n");
+    say!("{SCORE_KEY}\n");
 
-    println!("{:<26} {:>8} {:>8}", "cost", "now", "fitted");
+    say!("{:<26} {:>8} {:>8}", "cost", "now", "fitted");
     let mut best = best;
     for &(index, ..) in &fitted {
-        println!("{:<26} {:>8.3} {:>8.3}", now.parameters()[index].0, *now.parameters()[index].1, *best.parameters()[index].1);
+        say!("{:<26} {:>8.3} {:>8.3}", now.parameters()[index].0, *now.parameters()[index].1, *best.parameters()[index].1);
     }
     Ok(())
 }
@@ -339,12 +410,12 @@ fn print_scores(title: &str, charts: &[cost_fit::Chart], costs: &Costs, threads:
     let start = Instant::now();
     let footed = cost_fit::foot_all(charts, costs, threads);
     let score = cost_fit::score(charts, &footed.counts);
-    println!("{title} ({} charts, footed in {:.1} s on {threads} threads):", charts.len(), start.elapsed().as_secs_f64());
-    println!("{:<13} {:>7} {:>7} {:>7} {:>7} {:>12}", "", "all", "ours", "sheet", "error", "correlation");
+    say!("{title} ({} charts, footed in {:.1} s on {threads} threads):", charts.len(), start.elapsed().as_secs_f64());
+    say!("{:<13} {:>7} {:>7} {:>7} {:>7} {:>12}", "", "all", "ours", "sheet", "error", "correlation");
     for (column, name) in COLUMNS.iter().enumerate() {
         let sheet: Vec<f64> = charts.iter().map(|chart| chart.sheet[column]).collect();
         let ours: Vec<f64> = footed.counts.iter().map(|counts| counts[column]).collect();
-        println!(
+        say!(
             "{name:<13} {:>7} {:>7} {:>7} {:>7.3} {:>12.3}{}",
             footed.all[column],
             score.totals[column],
@@ -355,7 +426,7 @@ fn print_scores(title: &str, charts: &[cost_fit::Chart], costs: &Costs, threads:
         );
     }
     let dropped = if footed.inexact > 0 { format!(" ({} segments had branches dropped)", footed.inexact) } else { String::new() };
-    println!("score {:.4}{dropped}", score.score);
+    say!("score {:.4}{dropped}", score.score);
     score
 }
 
@@ -373,8 +444,9 @@ fn scan_values(name: &str, value: f64) -> Vec<f64> {
 /// The dance-single charts under `songs` that `sheet` has counts for.
 fn sheet_charts(songs: &Path, sheet: &Sheet) -> Result<Vec<cost_fit::Chart>, Box<dyn Error>> {
     let (mut charts, mut missing) = (Vec::new(), 0);
-    for (song_index, song) in sorted_paths(songs)?.into_iter().filter(|path| path.is_dir()).enumerate() {
-        for file in sorted_paths(&song)?.into_iter().filter(|path| path.extension().is_some_and(|ext| ext == "sm")) {
+    for song in song_folders(songs)? {
+        let song_index = song.index;
+        for file in song.simfiles {
             let Ok(sim) = SimFile::from_file(&file) else {
                 eprintln!("skipping {}: it doesn't load", file.display());
                 continue;
@@ -395,8 +467,40 @@ fn sheet_charts(songs: &Path, sheet: &Sheet) -> Result<Vec<cost_fit::Chart>, Box
     if charts.is_empty() {
         return Err(format!("none of the charts in {} are in the sheet's {SHEET_FOLDER} folder", songs.display()).into());
     }
-    println!("{} charts from {} are in the sheet ({missing} aren't)", charts.len(), songs.display());
+    say!("{} charts from {} are in the sheet ({missing} aren't)", charts.len(), songs.display());
     Ok(charts)
+}
+
+/// A song folder with at least one `.sm` file.
+struct SongFolder {
+    /// Its place among all the song folders, in name order
+    index: usize,
+    name: String,
+    /// In name order
+    simfiles: Vec<PathBuf>,
+}
+
+/// The song folders in `songs`, in name order. One with no `.sm` file is left out with a
+/// warning, which says if it has a `.ssc` (not read), and so is their number.
+fn song_folders(songs: &Path) -> io::Result<Vec<SongFolder>> {
+    let has = |path: &Path, extension: &str| path.extension().is_some_and(|ext| ext == extension);
+    let (mut folders, mut skipped) = (Vec::new(), 0);
+    for (index, song) in sorted_paths(songs)?.into_iter().filter(|path| path.is_dir()).enumerate() {
+        let name = song.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let files = sorted_paths(&song)?;
+        let simfiles: Vec<PathBuf> = files.iter().filter(|path| has(path, "sm")).cloned().collect();
+        if simfiles.is_empty() {
+            let why = if files.iter().any(|path| has(path, "ssc")) { "only a .ssc, which isn't read" } else { "no simfile" };
+            eprintln!("skipping {name}: no .sm file ({why})");
+            skipped += 1;
+            continue;
+        }
+        folders.push(SongFolder { index, name, simfiles });
+    }
+    if skipped > 0 {
+        eprintln!("{skipped} of the {} song folders in {} have no .sm file", folders.len() + skipped, songs.display());
+    }
+    Ok(folders)
 }
 
 /// A folder's entries in name order.
@@ -430,12 +534,12 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
     let name = |chart: &SingleChart| format!("{:?}", chart.difficulty);
 
     let Some(difficulty) = difficulty else {
-        println!("{} by {}", sim.title, sim.artist);
-        println!("{:<10} {:>6} {:>6} {:>9}  footing; patterns", "chart", "rating", "notes", "segments");
+        say!("{} by {}", sim.title, sim.artist);
+        say!("{:<10} {:>6} {:>6} {:>9}  footing; patterns", "chart", "rating", "notes", "segments");
         for chart in singles {
             let footed = foot_chart(chart, &sim.bpms, &sim.stops, &COSTS);
             let summary = Summary::of(&footed);
-            println!(
+            say!(
                 "{:<10} {:>6} {:>6} {:>9}  {}; {}",
                 name(chart),
                 chart.rating,
@@ -445,7 +549,7 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
                 summary.counts(Source::FootingPattern).unwrap_or("none".into())
             );
         }
-        println!("\nadd a difficulty (e.g. hard) for one chart's footing");
+        say!("\nadd a difficulty (e.g. hard) for one chart's footing");
         return Ok(());
     };
 
@@ -665,7 +769,7 @@ fn cached_samples(songs: &Path) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Er
         fs::create_dir_all(dir)?;
     }
     cache.save(CACHE_FILE)?;
-    println!(
+    say!(
         "{} charts from {} ({} files from the cache, {} analyzed), {} features each",
         samples.len(),
         songs.display(),
@@ -685,17 +789,18 @@ fn finite_features(stats: &ChartStatistics) -> Result<Vec<f32>, String> {
     }
 }
 
-/// Every dance-single chart in the `.sm` files of the song folders in `songs`. Files that don't
-/// load, and charts with a non-finite statistic, are skipped with a warning.
+/// Every dance-single chart in the `.sm` files of the song folders in `songs`. Folders with no
+/// `.sm`, files that don't load, and charts with a non-finite statistic, are skipped with a
+/// warning.
 ///
 /// Read in sorted order: listing order differs between machines, and would change the seeded
 /// split.
 fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut feature_names = Vec::new();
     let mut samples = Vec::new();
-    for song in sorted_paths(songs)?.into_iter().filter(|path| path.is_dir()) {
-        let song_name = song.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        for file in sorted_paths(&song)?.into_iter().filter(|path| path.extension().is_some_and(|ext| ext == "sm")) {
+    for song in song_folders(songs)? {
+        let song_name = song.name;
+        for file in song.simfiles {
             let charts = match cache.analyze_file(&file) {
                 Ok(charts) => charts,
                 Err(e) => {
@@ -721,7 +826,9 @@ fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<String>, Ve
 fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dyn Error>> {
     let feature_names: Vec<&str> = feature_names.iter().map(String::as_str).collect();
     let feature_names = &feature_names[..];
-    let (train_rows, val_rows, test_rows) = train::split_rows(samples.len(), &TrainingConfig::new().with_split_seed(SPLIT_SEED));
+    let split = TrainingConfig::new().with_split_seed(SPLIT_SEED);
+    enough_charts(samples.len(), &split, 2)?;
+    let (train_rows, val_rows, test_rows) = train::split_rows(samples.len(), &split);
     let features = |rows: &[usize]| -> Vec<Vec<f32>> { rows.iter().map(|&row| samples[row].features.clone()).collect() };
     let train = features(&train_rows);
     let held_out = features(&[val_rows, test_rows].concat());
@@ -729,11 +836,11 @@ fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dy
     let pca = Pca::fit(feature_names, &train);
     pca.save(PCA_FILE)?;
     let num_components = pca.components.len();
-    println!(
+    say!(
         "\nPCA of {num_components} standardized features, fitted on the {} training charts (split seed {SPLIT_SEED}), saved to {PCA_FILE}",
         train.len()
     );
-    println!("held-out: the {} validation and test charts, standardized with the training statistics\n", held_out.len());
+    say!("held-out: the {} validation and test charts, standardized with the training statistics\n", held_out.len());
 
     let train_scores = pca.transform(&train, num_components);
     let ratings: Vec<f64> = train_rows.iter().map(|&row| samples[row].rating as f64).collect();
@@ -743,7 +850,7 @@ fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dy
         (0..num_components).map(|k| held_out_scores.iter().map(|row| (row[k] as f64).powi(2)).sum()).collect();
     let held_out_total: f64 = held_out_squares.iter().sum();
 
-    println!("{:>2} {:>8} {:>7} {:>7} {:>9} {:>7}  largest loadings", "pc", "variance", "share", "total", "held-out", "rating");
+    say!("{:>2} {:>8} {:>7} {:>7} {:>9} {:>7}  largest loadings", "pc", "variance", "share", "total", "held-out", "rating");
     let (mut total, mut held_out_so_far) = (0.0, 0.0);
     for (k, share) in pca.explained_variance_ratio().into_iter().enumerate() {
         total += share;
@@ -752,7 +859,7 @@ fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dy
         let mut loadings: Vec<(f64, &str)> = pca.components[k].iter().copied().zip(feature_names.iter().copied()).collect();
         loadings.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
         let largest: Vec<String> = loadings.iter().take(4).map(|(loading, name)| format!("{loading:+.2} {name}")).collect();
-        println!(
+        say!(
             "{:>2} {:>8.3} {:>6.1}% {:>6.1}% {:>8.1}% {:>+7.2}  {}",
             k + 1,
             pca.variances[k],
@@ -763,8 +870,8 @@ fn report_pca(feature_names: &[String], samples: &[Sample]) -> Result<(), Box<dy
             largest.join(", ")
         );
     }
-    println!("\nshare, total: of the training charts' variance. held-out: running total over the held-out charts.");
-    println!("rating: correlation between the component and the official rating, over the training charts.");
+    say!("\nshare, total: of the training charts' variance. held-out: running total over the held-out charts.");
+    say!("rating: correlation between the component and the official rating, over the training charts.");
     Ok(())
 }
 
@@ -783,6 +890,79 @@ mod tests {
     use super::*;
 
     const COSTS: Costs = crate::chart_analyzer::TEST_COSTS;
+
+    #[test]
+    fn refuses_too_few_charts_to_split() {
+        let config = TrainingConfig::new().with_batch_size(32);
+        // 46 charts are the fewest that leave a batch of 32 to train on: 0.7 of 45 rounds to 31
+        assert!(enough_charts(46, &config, 32).is_ok());
+        let error = enough_charts(45, &config, 32).unwrap_err();
+        assert!(error.contains("45 charts are too few: they split into 31 to train on, 7 to validate and 7 to test"), "{error}");
+        // A PCA takes 2 rows, and something held out
+        assert!(enough_charts(7, &config, 2).is_ok());
+        assert!(enough_charts(2, &config, 2).is_err());
+        assert!(enough_charts(3, &config, 2).is_err());
+        assert!(enough_charts(0, &config, 2).is_err());
+    }
+
+    #[test]
+    fn lists_song_folders_and_skips_those_with_no_sm() {
+        let songs = std::env::temp_dir().join(format!("ddr-trainer-song-folders-{}", std::process::id()));
+        let file = |path: &str| {
+            let path = songs.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        };
+        file("Alpha/alpha.sm");
+        file("Alpha/alpha.ogg");
+        file("Beta/beta.ssc");
+        fs::create_dir_all(songs.join("Empty")).unwrap();
+        file("Gamma/two.sm");
+        file("Gamma/one.sm");
+        file("Gamma/gamma.ssc");
+        file("banner.png");
+
+        let folders = song_folders(&songs).unwrap();
+        let listed: Vec<(usize, &str, Vec<String>)> = folders
+            .iter()
+            .map(|folder| {
+                let names = folder.simfiles.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned());
+                (folder.index, folder.name.as_str(), names.collect())
+            })
+            .collect();
+        // Beta (1) and Empty (2) are left out, and keep their places in the count
+        assert_eq!(listed, [(0, "Alpha", vec!["alpha.sm".to_string()]), (3, "Gamma", vec!["one.sm".to_string(), "two.sm".to_string()])]);
+        fs::remove_dir_all(&songs).unwrap();
+        assert!(song_folders(&songs).is_err());
+    }
+
+    #[test]
+    fn checks_a_models_inputs_against_the_charts() {
+        let inputs = |features: &[&str], analyzer: u64| ModelInputs { features: features.iter().map(|name| name.to_string()).collect(), analyzer };
+        let trained = inputs(&["num_notes", "jack_count", "chart_dur"], 7);
+        assert_eq!(trained.check(&trained), Ok(None));
+        // Same names, another analyzer: a warning
+        let warning = trained.check(&inputs(&["num_notes", "jack_count", "chart_dur"], 8)).unwrap();
+        assert!(warning.is_some_and(|warning| warning.contains("has changed")));
+        // Renamed, reordered, fewer or more: refused, whatever the analyzer
+        let renamed = trained.check(&inputs(&["num_notes", "jack_total", "chart_dur"], 7)).unwrap_err();
+        assert!(renamed.contains("statistic 2 was jack_count, and is now jack_total"), "{renamed}");
+        assert!(trained.check(&inputs(&["jack_count", "num_notes", "chart_dur"], 7)).is_err());
+        let fewer = trained.check(&inputs(&["num_notes", "jack_count"], 7)).unwrap_err();
+        assert!(fewer.contains("it took 3 statistics, and charts now have 2"), "{fewer}");
+        assert!(trained.check(&inputs(&["num_notes", "jack_count", "chart_dur", "more"], 8)).is_err());
+
+        // Saved beside the model and read back
+        let dir = std::env::temp_dir().join(format!("ddr-trainer-model-inputs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        trained.save(&dir).unwrap();
+        assert_eq!(ModelInputs::load(&dir).unwrap(), trained);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(ModelInputs::load(&dir).is_err());
+        // What `train` saves is what `infer` compares with
+        let names: Vec<String> = ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(ModelInputs::now(names.clone()).check(&ModelInputs::now(names)), Ok(None));
+    }
 
     #[test]
     fn draws_a_footing() {

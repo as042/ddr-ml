@@ -11,7 +11,7 @@ use burn::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    dataset::{Dataset, shuffle},
+    dataset::{Dataset, scramble, shuffle},
     model::{Model, ModelConfig},
     pca::Pca,
 };
@@ -187,9 +187,10 @@ pub fn split_rows(num_rows: usize, config: &TrainingConfig) -> (Vec<usize>, Vec<
 }
 
 /// Training-split positions in batch order for `epoch`: new every epoch, the same every run.
+/// The seed is scrambled first, or seed 2's first epoch would be seed 1's second.
 fn epoch_order(n_train: usize, seed: u64, epoch: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n_train).collect();
-    shuffle(&mut order, seed.wrapping_add(epoch as u64));
+    shuffle(&mut order, scramble(seed).wrapping_add(epoch as u64));
     order
 }
 
@@ -321,7 +322,7 @@ impl ModelConfig {
         let train: Vec<Vec<f32>> = train_rows.iter().map(|&row| rows[row].clone()).collect();
         let pca = Pca::fit(&vec!["input"; width], &train);
         let num_components = config.input_pca.num_components(&pca);
-        println!(
+        say!(
             "PCA: training on {num_components} of {width} components, {:.1}% of the training split's variance",
             pca.explained_variance_ratio()[..num_components].iter().sum::<f64>() * 100.0
         );
@@ -376,8 +377,8 @@ impl Model {
         );
         assert!(n_val > 0 && n_test > 0, "validation and test splits must be non-empty");
 
-        println!("{} rows: {n_train} to train on, {n_val} to validate, {n_test} to test", dataset.x.dims()[0]);
-        println!("train and val mse are on standardized targets, so 1 is no better than predicting the average\n");
+        say!("{} rows: {n_train} to train on, {n_val} to validate, {n_test} to test", dataset.x.dims()[0]);
+        say!("train and val mse are on standardized targets, so 1 is no better than predicting the average\n");
 
         let split = |t: &Tensor<2>| {
             (select_rows(t, &train_rows), select_rows(t, &val_rows), select_rows(t, &test_rows))
@@ -452,20 +453,20 @@ impl Model {
                 epochs_since_improvement += 1;
                 if epochs_since_improvement % config.lr_patience == 0 {
                     lr *= config.lr_decay;
-                    println!("epoch {epoch:>3}: no improvement for {epochs_since_improvement} epochs, lr -> {lr:e}");
+                    say!("epoch {epoch:>3}: no improvement for {epochs_since_improvement} epochs, lr -> {lr:e}");
                 }
                 if epochs_since_improvement >= config.stop_patience {
-                    println!("epoch {epoch:>3}: early stop");
+                    say!("epoch {epoch:>3}: early stop");
                     break;
                 }
             }
 
             if let (true, Some(train_loss)) = (logging, train_loss) {
-                println!("epoch {epoch:>3}  train mse = {train_loss:.4e}  val mse = {val_loss:.4e}  (lr = {lr:e})");
+                say!("epoch {epoch:>3}  train mse = {train_loss:.4e}  val mse = {val_loss:.4e}  (lr = {lr:e})");
             }
         }
         if let Some(best_train) = best_train {
-            println!("best epoch {best_epoch}: train mse = {best_train:.4e}, val mse = {best_val:.4e} (the weights kept)");
+            say!("best epoch {best_epoch}: train mse = {best_train:.4e}, val mse = {best_val:.4e} (the weights kept)");
         }
 
         // Roll back to the best-validation weights
@@ -493,10 +494,10 @@ impl Model {
             .map(|((mse, max_error), var)| OutputMetrics { mse, max_error, r2: 1.0 - mse / var })
             .collect();
 
-        println!("\ntest results over {n_test} held-out rows (original units):");
-        println!("output           mse     rms error     max error          R²");
+        say!("\ntest results over {n_test} held-out rows (original units):");
+        say!("output           mse     rms error     max error          R²");
         for (i, m) in metrics.iter().enumerate() {
-            println!("{i:>6}  {:>12.4e}  {:>12.4}  {:>12.4}  {:>10.6}", m.mse, m.rms_error(), m.max_error, m.r2);
+            say!("{i:>6}  {:>12.4e}  {:>12.4}  {:>12.4}  {:>10.6}", m.mse, m.rms_error(), m.max_error, m.r2);
         }
 
         let predictions = to_vec(pred).chunks(self.num_outputs()).map(<[f32]>::to_vec).collect();
@@ -535,6 +536,14 @@ mod tests {
         assert_ne!(orders[0], epoch_order(10, 8, 1));
         // A dropped partial batch isn't always the same rows
         assert!(orders.iter().any(|order| order[9] != orders[0][9]));
+
+        // No seed's epochs are another's, a few epochs on
+        let all: Vec<Vec<usize>> = (0..6).flat_map(|seed| (1..=40).map(move |epoch| epoch_order(20, seed, epoch))).collect();
+        let mut distinct = all.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), all.len());
+        assert_ne!(epoch_order(20, 1, 2), epoch_order(20, 2, 1));
     }
 
     #[test]

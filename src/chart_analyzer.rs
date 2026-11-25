@@ -69,7 +69,7 @@ fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop],
     stats
 }
 
-/// Longest gap between notes of one segment (see `segments`).
+/// Longest gap between notes of one segment, unless a hold runs through it (see `segments`).
 const SEGMENT_BREAK_SECONDS: f64 = 2.0;
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
@@ -175,10 +175,25 @@ fn to_timed_notes(measures: &[Measure], timing: &Timing) -> Vec<TimedNote> {
     notes
 }
 
-/// Runs of notes (in time order) with no gap longer than `break_seconds`. A longer gap lets the
-/// player reset their feet, so techniques are only looked for inside a segment.
+/// Runs of notes (in time order) with no gap longer than `break_seconds`, unless a hold is
+/// still down at the gap's end. A longer gap lets the player reset their feet, so techniques
+/// are only looked for inside a segment. A foot on a hold can't reset.
 fn segments(notes: &[TimedNote], break_seconds: f64) -> Vec<&[TimedNote]> {
-    notes.chunk_by(|a, b| b.time - a.time <= break_seconds + TIME_EPSILON).collect()
+    let mut segments = Vec::new();
+    // Where the segment starts, and when the last of its holds so far ends
+    let (mut start, mut held_until) = (0, f64::NEG_INFINITY);
+    for (i, note) in notes.iter().enumerate() {
+        let apart = i > start && note.time - notes[i - 1].time > break_seconds + TIME_EPSILON;
+        if apart && held_until <= note.time + TIME_EPSILON {
+            segments.push(&notes[start..i]);
+            start = i;
+        }
+        held_until = note.hold_ends.iter().flatten().fold(held_until, |until, &end| until.max(end));
+    }
+    if start < notes.len() {
+        segments.push(&notes[start..]);
+    }
+    segments
 }
 
 /// Most branches the foot search keeps after a note (see `footing`).
@@ -445,6 +460,42 @@ mod tests {
                 assert!(segment.footing.exact);
             }
         }
+    }
+
+    #[test]
+    fn keeps_a_hold_and_the_notes_after_it_in_one_segment() {
+        // A tap on `arrow`, held until `held_until` if it's a hold
+        let at = |time: f64, arrow: usize, held_until: Option<f64>| {
+            let (mut row, mut hold_ends) = ([Note::Empty; 4], [None; 4]);
+            row[arrow] = if held_until.is_some() { Note::HoldStart } else { Note::Tap };
+            hold_ends[arrow] = held_until;
+            TimedNote { time, beat: time, row, hold_ends }
+        };
+        let lengths = |notes: &[TimedNote]| -> Vec<usize> {
+            segments(notes, SEGMENT_BREAK_SECONDS).iter().map(|segment| segment.len()).collect()
+        };
+        // Taps: a gap of 2.5 s is a break, one of 2 s isn't
+        assert_eq!(lengths(&[at(0.0, 0, None), at(1.0, 1, None), at(3.5, 2, None), at(4.0, 3, None)]), [2, 2]);
+        assert_eq!(lengths(&[at(0.0, 0, None), at(2.0, 1, None)]), [2]);
+        // Left held to 4 s: the taps from 2.5 s are under it
+        let held = [at(0.0, 0, Some(4.0)), at(2.5, 1, None), at(3.0, 2, None), at(3.5, 1, None)];
+        assert_eq!(lengths(&held), [4]);
+        // Once the hold is over, or as it ends, the gap since the note before decides again
+        assert_eq!(lengths(&[at(0.0, 0, Some(2.4)), at(2.5, 1, None)]), [1, 1]);
+        assert_eq!(lengths(&[at(0.0, 0, Some(2.5)), at(2.5, 1, None)]), [1, 1]);
+        assert_eq!(lengths(&[at(0.0, 0, Some(2.6)), at(2.5, 1, None)]), [2]);
+        // The longest hold so far counts, not just the last note's
+        assert_eq!(lengths(&[at(0.0, 0, Some(6.0)), at(1.0, 1, Some(1.5)), at(5.0, 2, None)]), [3]);
+        assert_eq!(lengths(&[at(0.0, 0, Some(6.0)), at(1.0, 1, Some(1.5)), at(7.0, 2, None)]), [2, 1]);
+        assert_eq!(lengths(&[]), Vec::<usize>::new());
+
+        // The foot search then knows the left foot is down: Down, Up, Down under the hold
+        // takes a bracket or doublesteps, where on their own they would be free
+        let footing = foot_segment(&held, &COSTS);
+        assert!(footing.cost > 0.0);
+        assert_eq!(foot_segment(&held[1..], &COSTS).cost, 0.0);
+        let found = sequences::find(&held);
+        assert_eq!(found.iter().filter(|found| found.technique == Technique::HeldStep).count(), 3);
     }
 
     #[test]

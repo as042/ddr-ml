@@ -33,16 +33,20 @@ pub fn shuffle<T>(items: &mut [T], seed: u64) {
     let mut state = seed;
     let mut next = || {
         state = state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
+        scramble(state)
     };
     // Fisher-Yates. The modulo's bias is negligible (around 1e-16).
     for i in (1..items.len()).rev() {
         let j = (next() % (i as u64 + 1)) as usize;
         items.swap(i, j);
     }
+}
+
+/// SplitMix64's output step: nearby numbers come out unrelated.
+pub fn scramble(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+#[macro_use]
+mod out;
 mod dataset;
 mod device;
 mod model;
@@ -49,7 +51,7 @@ fn main() -> ExitCode {
 /// The first argument picks the tool, the rest are its own.
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let Some((tool, args)) = args.split_first() else {
-        println!("{USAGE}");
+        say!("{USAGE}");
         return Ok(());
     };
     match tool.as_str() {
@@ -61,7 +63,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "scan-costs" => tools::scan_costs(args),
         "fit-costs" => tools::fit_costs(args),
         "help" | "-h" | "--help" => {
-            println!("{USAGE}");
+            say!("{USAGE}");
             Ok(())
         }
         _ => Err(format!("unknown tool `{tool}`\n\n{USAGE}").into()),

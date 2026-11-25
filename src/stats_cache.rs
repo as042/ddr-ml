@@ -46,7 +46,8 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-fn analyzer_fingerprint() -> u64 {
+/// A hash of the source files that decide a chart's statistics.
+pub fn analyzer_fingerprint() -> u64 {
     FINGERPRINTED
         .iter()
         .fold(FNV_OFFSET_BASIS, |hash, (path, source)| fnv1a(fnv1a(hash, path.as_bytes()), source.as_bytes()))

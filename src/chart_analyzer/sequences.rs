@@ -40,11 +40,17 @@ fn shares_an_arrow(a: &TimedNote, b: &TimedNote) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::footing::tests::segment;
+    use super::super::{TEST_COSTS, foot_arrows};
     use super::*;
+    use crate::sim_loader::Note;
 
     /// (note, notes, speed) of each `technique` found.
     fn found(tokens: &str, technique: Technique) -> Vec<(usize, usize, f64)> {
-        find(&segment(tokens))
+        found_in(&segment(tokens), technique)
+    }
+
+    fn found_in(notes: &[TimedNote], technique: Technique) -> Vec<(usize, usize, f64)> {
+        find(notes)
             .into_iter()
             .filter(|occurrence| occurrence.technique == technique)
             .map(|occurrence| (occurrence.note, occurrence.notes, occurrence.speed))
@@ -76,12 +82,16 @@ mod tests {
     fn finds_held_steps() {
         // Left held from the first note to 0.375 s: the two notes under it
         assert_eq!(found("L+ D R L- D", Technique::HeldStep), [(1, 1, 8.0), (2, 1, 8.0)]);
-        // Not the note the hold starts with, nor the one it ends with
-        assert_eq!(found("L+R . L-D U", Technique::HeldStep), []);
         // Two holds: under the longer after the shorter ends
         assert_eq!(found("L+ U+ . U- D . L- R", Technique::HeldStep), [(1, 1, 8.0), (2, 1, 1.0 / 0.375)]);
-        // To the end with no end written (`segment` leaves it open: not a hold)
-        assert_eq!(found("L D U R", Technique::HeldStep), []);
+        // A hold with no end written isn't one
+        assert_eq!(found("L+ D U R", Technique::HeldStep), []);
+        // Left held under Up. Not under the Right it starts with, nor the Down it ends with.
+        let mixed = foot_arrows("[L+R]U[L-D]R", &TEST_COSTS, 1.0).unwrap().notes;
+        let rows: Vec<[Note; 4]> = mixed.iter().map(|note| note.row).collect();
+        assert_eq!(rows[0], [Note::HoldStart, Note::Empty, Note::Empty, Note::Tap]);
+        assert_eq!(rows[2], [Note::End, Note::Tap, Note::Empty, Note::Empty]);
+        assert_eq!(found_in(&mixed, Technique::HeldStep), [(1, 1, 8.0)]);
     }
 
     #[test]

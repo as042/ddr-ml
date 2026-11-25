@@ -40,6 +40,9 @@ const CHAOS: Scale = Scale { knee: 2000.0, low: (1.0, 20.0), high: (21605.0, 100
 
 const VOLTAGE_BEATS: f64 = 4.0;
 
+/// Tolerance for rounding in sums of beats. Far below the finest row (a 192nd is 1/48 beat).
+const BEAT_EPSILON: f64 = 1e-6;
+
 /// Irregularity is this many times as much for each BPM changed by a minute.
 const CHAOS_PER_BPM_CHANGE: f64 = 1.0 / 1500.0;
 
@@ -113,7 +116,7 @@ pub(super) fn count(measures: &[Measure], timing: &Timing, stats: &mut ChartStat
 fn most_in_a_window(rows: &[Row]) -> usize {
     let (mut most, mut end) = (0, 0);
     for start in 0..rows.len() {
-        while end < rows.len() && rows[end].beat < rows[start].beat + VOLTAGE_BEATS {
+        while end < rows.len() && rows[end].beat < rows[start].beat + VOLTAGE_BEATS - BEAT_EPSILON {
             end += 1;
         }
         most = most.max(end - start);
@@ -203,6 +206,20 @@ mod tests {
             let s = stats("chart_stats.sm", difficulty);
             assert_eq!([s.radar_stream, s.radar_voltage, s.radar_air, s.radar_freeze, s.radar_chaos], radar, "{difficulty:?}");
         }
+    }
+
+    #[test]
+    fn leaves_the_row_a_whole_window_later_out_of_it() {
+        // A tap on row 7 of 12 in each of two measures: 4 beats apart, at beats an f64 can't
+        // hold exactly. 1 in any 4 beats, 30 a minute at 120 BPM.
+        let mut rows = vec!["0000"; 12];
+        rows[7] = "1000";
+        let apart = [measure(&rows), measure(&rows)];
+        assert_eq!(radar(&apart, &[(0.0, 120.0)], &[])[1], 5.0);
+        // A row sooner, both are in one window
+        let mut sooner = vec!["0000"; 12];
+        sooner[6] = "1000";
+        assert_eq!(radar(&[measure(&rows), measure(&sooner)], &[(0.0, 120.0)], &[])[1], 10.0);
     }
 
     #[test]

@@ -44,6 +44,22 @@ CASES = {
     "bad_stop_length.sm": ("The stop's length is not a number.", "#STOPS:;", "#STOPS:16.000=long;"),
     "missing_bpms.sm": ("There is no #BPMS tag.", "#BPMS:0.000=120.000;\n", ""),
     "unterminated_tag.sm": ("The chart is missing its closing ';'.", "0000\n;\n", "0000\n"),
+    "tag_without_semicolon.sm": (
+        "#OFFSET is missing its ';', so it would take #BPMS for part of its value.",
+        "#OFFSET:0.000;",
+        "#OFFSET:0.000",
+    ),
+    "negative_bpm.sm": (
+        "A BPM is negative: a warp, which would run time backwards.",
+        "#BPMS:0.000=120.000;",
+        "#BPMS:0.000=120.000,16.000=-120.000;",
+    ),
+    "negative_stop.sm": (
+        "A stop is negative: a warp, which would run time backwards.",
+        "#STOPS:;",
+        "#STOPS:8.000=-0.500;",
+    ),
+    "infinite_bpm.sm": ("A BPM is not a finite number.", "#BPMS:0.000=120.000;", "#BPMS:0.000=inf;"),
     "too_few_chart_fields.sm": (
         "The chart header is missing its groove radar line, so #NOTES has 5 fields instead of 6.",
         "     8:\n     :\n",

@@ -119,6 +119,14 @@ impl SimFile {
         for line in content.lines() {
             // Strip `//` comments
             let line = line.split("//").next().unwrap_or_default();
+            // No value has a line starting with `#`: the tag before has lost its `;`, and would
+            // take this one for part of its value
+            if line.trim_start().starts_with('#')
+                && let Some(open) = pending.find('#')
+            {
+                let name = pending[open + 1..].split(':').next().unwrap_or_default().trim();
+                return Err(invalid(format!("#{name}: missing ';' (the next tag starts before it ends)")));
+            }
             pending.push_str(line);
             pending.push('\n');
 
@@ -138,20 +146,22 @@ impl SimFile {
                     "BACKGROUND" => sim.background = value.to_string(),
                     "CDTITLE" => sim.cd_title = value.to_string(),
                     "MUSIC" => sim.music = value.to_string(),
-                    "OFFSET" => sim.offset = parse_number("#OFFSET", value)?,
-                    "SAMPLESTART" => sim.sample_start = parse_number("#SAMPLESTART", value)?,
-                    "SAMPLELENGTH" => sim.sample_length = parse_number("#SAMPLELENGTH", value)?,
+                    "OFFSET" => sim.offset = parse_number_or_zero("#OFFSET", value)?,
+                    "SAMPLESTART" => sim.sample_start = parse_number_or_zero("#SAMPLESTART", value)?,
+                    "SAMPLELENGTH" => sim.sample_length = parse_number_or_zero("#SAMPLELENGTH", value)?,
                     "BPMS" => {
-                        sim.bpms = parse_beat_pairs("#BPMS", value)?
-                            .into_iter()
-                            .map(|(beat, bpm)| BPMChange { beat, bpm })
-                            .collect()
+                        let bpms = parse_beat_pairs("#BPMS", value)?;
+                        if let Some((beat, bpm)) = bpms.iter().find(|&&(_, bpm)| bpm <= 0.0) {
+                            return Err(invalid(format!("#BPMS: a BPM must be above 0, got {bpm} on beat {beat}{WARP}")));
+                        }
+                        sim.bpms = bpms.into_iter().map(|(beat, bpm)| BPMChange { beat, bpm }).collect()
                     }
                     "STOPS" => {
-                        sim.stops = parse_beat_pairs("#STOPS", value)?
-                            .into_iter()
-                            .map(|(beat, seconds)| Stop { beat, seconds })
-                            .collect()
+                        let stops = parse_beat_pairs("#STOPS", value)?;
+                        if let Some((beat, seconds)) = stops.iter().find(|&&(_, seconds)| seconds < 0.0) {
+                            return Err(invalid(format!("#STOPS: a stop can't be negative, got {seconds} on beat {beat}{WARP}")));
+                        }
+                        sim.stops = stops.into_iter().map(|(beat, seconds)| Stop { beat, seconds }).collect()
                     }
                     "BGSTAGE" => sim.bg_stage = value.to_string(),
                     "NOTES" => sim.step_charts.extend(parse_chart(value)?),
@@ -170,12 +180,22 @@ impl SimFile {
     }
 }
 
+/// Some files skip part of the song with a negative BPM or stop.
+const WARP: &str = " (a warp, which isn't supported)";
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
 }
 
+/// A finite number: `inf` and `NaN` parse as f64s, but nothing here can use them.
 fn parse_number(what: &str, value: &str) -> io::Result<f64> {
-    value.trim().parse().map_err(|_| invalid(format!("{what}: expected a number, got {value:?}")))
+    let number = value.trim().parse().ok().filter(|number: &f64| number.is_finite());
+    number.ok_or_else(|| invalid(format!("{what}: expected a number, got {value:?}")))
+}
+
+/// 0 for an empty value, as for a missing tag.
+fn parse_number_or_zero(what: &str, value: &str) -> io::Result<f64> {
+    if value.trim().is_empty() { Ok(0.0) } else { parse_number(what, value) }
 }
 
 /// Comma-separated `beat=value` pairs, as in `#BPMS` (`0=150,64.5=300`) and `#STOPS`.
@@ -200,15 +220,11 @@ fn parse_chart(value: &str) -> io::Result<Option<StepChart>> {
         return Err(invalid(format!("#NOTES: expected 6 ':'-separated fields, got {}", fields.len())));
     };
 
-    let difficulty = match difficulty_name.to_ascii_lowercase().as_str() {
-        "beginner" => ChartDifficulty::Beginner,
-        "easy" => ChartDifficulty::Easy,
-        "medium" => ChartDifficulty::Medium,
-        "hard" => ChartDifficulty::Hard,
-        "challenge" => ChartDifficulty::Challenge,
-        "edit" => return Ok(None),
-        _ => return Err(invalid(format!("#NOTES: unknown difficulty {difficulty_name:?}"))),
-    };
+    // Before the difficulty: other games have difficulties of their own
+    if !matches!(step_type, "dance-single" | "dance-double") {
+        return Ok(None);
+    }
+    let Some(difficulty) = parse_difficulty(difficulty_name)? else { return Ok(None) };
 
     let chart = match step_type {
         "dance-single" => StepChart::DanceSingle(SingleChart {
@@ -217,10 +233,24 @@ fn parse_chart(value: &str) -> io::Result<Option<StepChart>> {
             measures: parse_measures(note_data)
                 .map_err(|e| invalid(format!("#NOTES ({step_type} {difficulty_name}): {e}")))?,
         }),
-        "dance-double" => StepChart::DanceDouble(DoubleChart {}),
-        _ => return Ok(None),
+        _ => StepChart::DanceDouble(DoubleChart {}),
     };
     Ok(Some(chart))
+}
+
+/// A `#NOTES` difficulty, by its name or one of the old names StepMania still reads, as
+/// StepMania maps them (its "expert" is Challenge, not DDR's Expert). `None` for Edit.
+fn parse_difficulty(name: &str) -> io::Result<Option<ChartDifficulty>> {
+    let difficulty = match name.to_ascii_lowercase().as_str() {
+        "beginner" => ChartDifficulty::Beginner,
+        "easy" | "basic" | "light" => ChartDifficulty::Easy,
+        "medium" | "another" | "trick" | "standard" | "difficult" => ChartDifficulty::Medium,
+        "hard" | "ssr" | "maniac" | "heavy" => ChartDifficulty::Hard,
+        "challenge" | "smaniac" | "expert" | "oni" => ChartDifficulty::Challenge,
+        "edit" => return Ok(None),
+        _ => return Err(invalid(format!("#NOTES: unknown difficulty {name:?}"))),
+    };
+    Ok(Some(difficulty))
 }
 
 /// Measures are separated by `,` and hold one row per line.
@@ -412,12 +442,16 @@ mod tests {
 
     /// (file in `test_resources/invalid/`, part of the error it must fail with). The files come
     /// from `make_invalid_simfiles.py`, and each one's first line says what's broken.
-    const INVALID_FILES: [(&str, &str); 11] = [
+    const INVALID_FILES: [(&str, &str); 15] = [
         ("bad_offset.sm", r#"#OFFSET: expected a number, got "abc""#),
         ("bpm_without_equals.sm", r#"#BPMS: expected beat=value, got "64.000""#),
         ("bad_stop_length.sm", r#"#STOPS: expected a number, got "long""#),
         ("missing_bpms.sm", "missing #BPMS"),
         ("unterminated_tag.sm", "the file ends in the middle of a tag"),
+        ("tag_without_semicolon.sm", "#OFFSET: missing ';' (the next tag starts before it ends)"),
+        ("negative_bpm.sm", "#BPMS: a BPM must be above 0, got -120 on beat 16 (a warp"),
+        ("negative_stop.sm", "#STOPS: a stop can't be negative, got -0.5 on beat 8 (a warp"),
+        ("infinite_bpm.sm", r#"#BPMS: expected a number, got "inf""#),
         ("too_few_chart_fields.sm", "#NOTES: expected 6 ':'-separated fields, got 5"),
         ("unknown_difficulty.sm", r#"#NOTES: unknown difficulty "Impossible""#),
         ("bad_meter.sm", r#"#NOTES meter: expected a number, got "eight""#),
@@ -451,6 +485,96 @@ mod tests {
         let mut listed: Vec<&str> = INVALID_FILES.iter().map(|(name, _)| *name).collect();
         listed.sort();
         assert_eq!(files, listed);
+    }
+
+    /// A file that loads, with `old` replaced by `new`.
+    fn changed(old: &str, new: &str) -> io::Result<SimFile> {
+        let valid = "#TITLE:t;\n#DISPLAYBPM:120;\n#BPMS:0=120;\n#STOPS:4=0.5;\n#SUBTITLE:s;\n#NOTES:dance-single::Hard:8::1000\n0000\n;\n";
+        assert!(SimFile::parse(valid).is_ok());
+        assert_eq!(valid.matches(old).count(), 1, "{old:?}");
+        SimFile::parse(&valid.replace(old, new))
+    }
+
+    #[test]
+    fn loads_empty_header_numbers_as_zero() {
+        let sim = changed("#DISPLAYBPM:120;", "#OFFSET:;\n#SAMPLESTART: ;\n#SAMPLELENGTH:\n;").unwrap();
+        assert_eq!((sim.offset, sim.sample_start, sim.sample_length), (0.0, 0.0, 0.0));
+        let sim = changed("#DISPLAYBPM:120;", "#OFFSET:-0.5;\n#SAMPLESTART:12;").unwrap();
+        assert_eq!((sim.offset, sim.sample_start, sim.sample_length), (-0.5, 12.0, 0.0));
+        // Not a number at all is still an error, and so is a chart with no meter
+        assert!(changed("#DISPLAYBPM:120;", "#OFFSET:abc;").is_err());
+        assert!(changed("Hard:8:", "Hard::").is_err());
+    }
+
+    #[test]
+    fn reads_the_step_type_before_the_difficulty() {
+        let chart = |step_type: &str, difficulty: &str| parse_chart(&format!("{step_type}::{difficulty}:8::1000\n0000\n"));
+        let single = |difficulty: &str| match chart("dance-single", difficulty) {
+            Ok(Some(StepChart::DanceSingle(single))) => Some(single.difficulty),
+            _ => None,
+        };
+        // Another game's chart is skipped whatever its difficulty is called
+        for other in ["pump-single", "lights-cabinet", "kb7-single"] {
+            for difficulty in ["Hard", "Crazy", "Nightmare", ""] {
+                assert!(matches!(chart(other, difficulty), Ok(None)), "{other} {difficulty:?}");
+            }
+        }
+        // A dance chart's has to be one StepMania reads
+        assert!(chart("dance-single", "Crazy").is_err());
+        assert!(chart("dance-double", "Crazy").is_err());
+        assert!(matches!(chart("dance-double", "Oni"), Ok(Some(StepChart::DanceDouble(_)))));
+        assert!(matches!(chart("dance-single", "Edit"), Ok(None)));
+        assert!(matches!(chart("dance-double", "edit"), Ok(None)));
+
+        // Old names, in any case
+        let expected = [
+            (Beginner, &["Beginner", "beginner"][..]),
+            (Easy, &["Easy", "Basic", "LIGHT"][..]),
+            (Medium, &["Medium", "Another", "Trick", "Standard", "Difficult"][..]),
+            (Hard, &["Hard", "SSR", "Maniac", "Heavy"][..]),
+            (Challenge, &["Challenge", "SManiac", "Expert", "Oni"][..]),
+        ];
+        for (difficulty, names) in expected {
+            for name in names {
+                assert_eq!(single(name), Some(difficulty), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_tag_that_runs_into_the_next() {
+        let error = |old: &str, new: &str| changed(old, new).err().map(|e| e.to_string()).unwrap_or_default();
+        // Would have taken the stops for part of an unused tag's value
+        assert!(error("#DISPLAYBPM:120;", "#DISPLAYBPM:120").starts_with("#DISPLAYBPM: missing ';'"));
+        // Would have taken the chart
+        assert!(error("#SUBTITLE:s;", "#SUBTITLE:s").starts_with("#SUBTITLE: missing ';'"));
+        assert!(error("#BPMS:0=120;", "#BPMS:0=120").starts_with("#BPMS: missing ';'"));
+        // The next tag indented, or after a blank line and a comment
+        assert!(error("#TITLE:t;\n", "#TITLE:t\n\n// note\n  \t").starts_with("#TITLE: missing ';'"));
+
+        // A `#` that doesn't start a line is part of the value, and a tag can still span lines
+        let sim = changed("#TITLE:t;", "#TITLE:Re:Quirks #2;").unwrap();
+        assert_eq!(sim.title, "Re:Quirks #2");
+        let sim = changed("#BPMS:0=120;", "#BPMS:0=120\n,8=240\n;#ARTIST:a;").unwrap();
+        assert_eq!((sim.bpms.len(), sim.artist.as_str()), (2, "a"));
+        // Text outside any tag is still skipped
+        assert!(changed("#TITLE:t;", "stray text\n#TITLE:t;").is_ok());
+    }
+
+    #[test]
+    fn rejects_timing_that_would_run_backwards() {
+        let error = |old: &str, new: &str| changed(old, new).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(error("#BPMS:0=120;", "#BPMS:0=120,8=-240;").contains("a BPM must be above 0, got -240 on beat 8"));
+        assert!(error("#BPMS:0=120;", "#BPMS:0=0;").contains("a BPM must be above 0, got 0 on beat 0"));
+        assert!(error("#STOPS:4=0.5;", "#STOPS:4=-0.25;").contains("a stop can't be negative, got -0.25 on beat 4"));
+        // A stop of no length is harmless
+        assert!(changed("#STOPS:4=0.5;", "#STOPS:4=0;").is_ok());
+        for not_finite in ["inf", "-inf", "NaN", "infinity"] {
+            assert!(error("#BPMS:0=120;", &format!("#BPMS:0={not_finite};")).contains("expected a number"), "{not_finite}");
+            assert!(error("#STOPS:4=0.5;", &format!("#STOPS:{not_finite}=1;")).contains("expected a number"), "{not_finite}");
+            assert!(parse_number("x", not_finite).is_err());
+        }
+        assert_eq!(parse_number("x", " -1.5e2 ").unwrap(), -150.0);
     }
 
     #[test]

@@ -5,7 +5,8 @@
 // One BPM (120, so quarter notes are 0.5 s apart and 8ths 0.25 s), no stops.
 //   - the duration runs from the chart's first object (a note, mine or hold end) to its last,
 //     and the active ratio is the fraction of it between notes at most 1 s apart, or holding
-//   - the notes are split into segments at gaps longer than 2 s. The foot simulation starts
+//   - the notes are split into segments at gaps longer than 2 s, unless a hold is still
+//     down at the gap's end. The foot simulation starts
 //     each segment with the feet at home (left foot on Left, right on Right) and gives it
 //     the cheapest footing by its costs. The tests use fixed ones (TEST_COSTS in
 //     src/chart_analyzer/footing.rs), where an event costs its base plus its speed cost

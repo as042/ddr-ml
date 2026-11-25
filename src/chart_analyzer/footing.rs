@@ -167,7 +167,7 @@ impl Turning {
             return;
         }
         // A 180 flip (only a jump can do it) has no direction: take it as back toward the screen.
-        if delta == 180 && angle > 0 {
+        if delta == 180 && wrap(angle) > 0 {
             delta = -180;
         }
         if self.direction != 0 && delta.signum() != self.direction {
@@ -1201,6 +1201,29 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn flips_back_toward_the_screen_whichever_way_it_has_turned() {
+        // Facing each way in turn, then the turn ended: (full spins, half spins) and the angle
+        let turned = |facings: &[i32]| {
+            let (mut turning, mut footing) = (Turning::new(Some(0)), Footing::default());
+            for &facing in facings {
+                turning.face(Some(facing), &mut footing);
+            }
+            let angle = turning.angle;
+            turning.finish(&mut footing);
+            ((footing.full_spins, footing.half_spins), angle)
+        };
+        // Three quarters round clockwise, facing left. The flip to facing right goes on round
+        // past the screen: one full spin, not a half spin there and another back.
+        assert_eq!(turned(&[90, 180, -90, 90]), ((1, 0), Some(450)));
+        assert_eq!(turned(&[-90, 180, 90, -90]), ((1, 0), Some(-450)));
+        // A quarter round, the flip comes back past the screen: no spin at all
+        assert_eq!(turned(&[90, -90]), ((0, 0), Some(-90)));
+        assert_eq!(turned(&[-90, 90]), ((0, 0), Some(90)));
+        // Without a flip, three quarters round is a half spin
+        assert_eq!(turned(&[90, 180, -90]), ((0, 1), Some(270)));
+    }
+
+    #[test]
     fn says_which_step_each_event_is_on() {
         // Notes 0.125 s apart: 8 a second
         let crossover = solve(&segment("L D R D L"), &COSTS, WIDTH);
@@ -1325,6 +1348,8 @@ pub(super) mod tests {
         let fast = solve(&at_speed("D+ R U R U D-", 4.0), &costs, WIDTH);
         assert_eq!(fast.cost, 3.0 * (costs.freeze_switch.base + costs.freeze_switch.speed * 4.0));
         assert_eq!(found_on(&fast, 2), [(Technique::FreezeSwitch, 32.0)]);
+        // Each switch moves both feet: one onto the note, the other onto the hold
+        assert_eq!(fast.moves.iter().map(|m| m.note).collect::<Vec<_>>(), [2, 2, 3, 3, 4, 4]);
         assert!(COSTS.freeze_switch.base > COSTS.freeze_switch.speed);
 
         // Never, at a price
