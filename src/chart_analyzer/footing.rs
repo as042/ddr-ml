@@ -778,11 +778,13 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
     let mut links: Vec<Vec<(usize, Step)>> = Vec::with_capacity(segment.len());
     let (mut nodes, mut merged, mut widest, mut exact) = (0, 0, 1, true);
 
+    // One layer per note: grow every branch left by the ways it can step note i
     for i in 0..segment.len() {
         let next_time = segment.get(i + 1).map_or(f64::INFINITY, |note| note.time);
         // None: merged into a cheaper branch
         let mut next: Vec<Option<Branch>> = Vec::new();
         let mut reached: HashMap<Key, usize> = HashMap::new();
+        // Each branch after the note before, by each way of stepping this note from it
         for (parent, state) in layer.iter().enumerate() {
             for (step, state) in options(segment, i, state, costs) {
                 nodes += 1;
@@ -806,6 +808,7 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
             }
         }
         let mut next: Vec<Branch> = next.into_iter().flatten().collect();
+        // Too many left: keep only the cheapest, so the result may no longer be exact
         if next.len() > max_width {
             next.sort_by_key(|branch| branch.state.cost);
             next.truncate(max_width);
@@ -816,6 +819,7 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
         layer = next.into_iter().map(|branch| branch.state).collect();
     }
 
+    // Pick the winner: the cheapest last branch, once its turn in progress is costed
     let mut best: Option<(u64, Events, usize)> = None;
     for (index, state) in layer.iter().enumerate() {
         let mut end = *state;
@@ -828,6 +832,8 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
         }
     }
     let (cost, events, mut index) = best.expect("a branch is always left");
+
+    // Recover the winner's steps by following its parents back, last note to first
     let mut steps = Vec::with_capacity(segment.len());
     for links in links.iter().rev() {
         let (parent, step) = links[index];
@@ -835,6 +841,8 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
         index = parent;
     }
     steps.reverse();
+
+    // Describe the winning footing: events and costs per note, occurrences, patterns and moves
     let (step_events, kinds) = replay(segment, &steps, &events);
     let mut occurrences: Vec<Occurrence> = Vec::new();
     for (i, added) in step_events.iter().enumerate() {
