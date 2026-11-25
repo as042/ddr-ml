@@ -30,6 +30,10 @@ tools:
                                speed times as fast, e.g. 2
   feet <simfile>               list a simfile's charts and what their footings add up to
   feet <simfile> <difficulty>  foot a chart, e.g. hard
+  analyze <simfile> <difficulty> [--<cost or setting> <value>]...
+                               run the whole chart analyzer on one chart and print its
+                               statistics as JSON, for other programs. Any cost or setting can
+                               be set (no arguments lists them). A simfile of - is read from stdin
   score-costs <sheet> [songs]  score the foot search's costs against a chart spreadsheet (.csv)
   scan-costs <sheet> [songs]   score them, then again with each cost changed on its own
   fit-costs <sheet> [songs]    search for the costs closest to the spreadsheet, on three songs in
@@ -59,6 +63,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "pca" => tools::pca(args),
         "infer" => tools::infer(args),
         "feet" => tools::feet(args),
+        "analyze" => tools::analyze(args),
         "score-costs" => tools::score_costs(args),
         "scan-costs" => tools::scan_costs(args),
         "fit-costs" => tools::fit_costs(args),

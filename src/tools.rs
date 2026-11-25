@@ -15,8 +15,8 @@ use burn::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::chart_analyzer::{
-    COSTS, ChartStatistics, Costs, Foot, FootedSegment, Source, Technique, analyze_singles, foot_arrows, foot_chart,
-    footing_segments,
+    COSTS, ChartStatistics, Costs, Foot, FootedSegment, SETTINGS, Settings, Source, Technique, analyze_single_chart,
+    analyze_singles, foot_arrows, foot_chart, footing_segments,
 };
 #[cfg(test)]
 use crate::chart_analyzer::Cost;
@@ -26,7 +26,7 @@ use crate::dataset::Dataset;
 use crate::device::DevicePreference;
 use crate::model::ModelConfig;
 use crate::pca::Pca;
-use crate::sim_loader::{SimFile, SingleChart, StepChart};
+use crate::sim_loader::{ChartDifficulty, SimFile, SingleChart, StepChart};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, TrainedModel, TrainingConfig};
 
@@ -235,6 +235,181 @@ pub fn feet(args: &[String]) -> Result<(), Box<dyn Error>> {
         footing_table(&segment, false)
     );
     print_report(&report)
+}
+
+/// Runs the whole chart analyzer on one dance-single chart and prints the result as JSON (see
+/// `analysis_json`), for other programs. Takes every input the analyzer has: the simfile (`-`
+/// reads its text from stdin), the difficulty, and any of the costs and settings
+/// (`--jack-base 0.5` or `--jack-base=0.5`), the rest being `COSTS` and `SETTINGS`. With no
+/// arguments, lists them.
+pub fn analyze(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.is_empty() || matches!(args, [only] if only == "--help") {
+        say!("{}", analyze_usage());
+        return Ok(());
+    }
+    let given = analyze_args(args)?;
+    let sim = if given.simfile == "-" {
+        SimFile::parse(&io::read_to_string(io::stdin())?).map_err(|e| format!("stdin: {e}"))?
+    } else {
+        SimFile::from_file(given.simfile).map_err(|e| format!("{}: {e}", given.simfile))?
+    };
+    print_report(&(analysis_json(&sim, given.difficulty, &given.costs, &given.settings)? + "\n"))
+}
+
+/// A cost's or setting's option: `--jack-base` for "jack base".
+fn option(name: &str) -> String {
+    format!("--{}", name.replace(' ', "-"))
+}
+
+/// `analyze`'s arguments, and every cost and setting with its default.
+fn analyze_usage() -> String {
+    let mut usage = String::from(
+        "usage: analyze <simfile> <difficulty> [--<cost or setting> <value>]...\n\n\
+         A simfile is a .sm file, its song folder, or - for its text on stdin.\n\ncosts (default):\n",
+    );
+    let mut costs = COSTS;
+    for (name, value) in costs.parameters() {
+        let _ = writeln!(usage, "  {:<30} {value}", option(name));
+    }
+    usage += "\nsettings (default):\n";
+    for (name, value) in SETTINGS.values() {
+        let _ = writeln!(usage, "  {:<30} {value}", option(name));
+    }
+    usage
+}
+
+/// What `analyze` is given.
+#[derive(Debug)]
+struct AnalyzeArgs<'a> {
+    simfile: &'a str,
+    difficulty: &'a str,
+    costs: Costs,
+    settings: Settings,
+}
+
+fn analyze_args(args: &[String]) -> Result<AnalyzeArgs<'_>, String> {
+    let (mut costs, mut settings) = (COSTS, SETTINGS);
+    let (mut given, mut positional) = (Vec::new(), Vec::new());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if !arg.starts_with("--") {
+            positional.push(arg.as_str());
+            continue;
+        }
+        let (flag, value) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        let cost = costs.parameters().into_iter().map(|(name, _)| name).find(|name| option(name) == flag);
+        let setting = settings.values().into_iter().map(|(name, _)| name).find(|name| option(name) == flag);
+        if cost.is_none() && setting.is_none() {
+            return Err(format!("unknown option {flag}\n\n{}", analyze_usage()));
+        }
+        if given.contains(&flag) {
+            return Err(format!("{flag} is given twice"));
+        }
+        given.push(flag);
+        let value = match value {
+            Some(value) => value,
+            None => args.next().ok_or_else(|| format!("{flag} needs a value"))?.as_str(),
+        };
+        let value: f64 = value.parse().map_err(|_| format!("{flag} takes a number, not {value}"))?;
+        let set = match (cost, setting) {
+            (Some(cost), _) => set_cost(&mut costs, cost, value),
+            (_, Some(setting)) => settings.set(setting, value),
+            (None, None) => unreachable!("an unknown option was refused"),
+        };
+        set.map_err(|must| format!("{flag} {must}, not {value}"))?;
+    }
+    match positional[..] {
+        [simfile, difficulty] => Ok(AnalyzeArgs { simfile, difficulty, costs, settings }),
+        _ => Err(format!("analyze takes a simfile and a difficulty, then any costs and settings\n\n{}", analyze_usage())),
+    }
+}
+
+/// Sets the cost called `name` (as in `Costs::parameters`), or says why `value` can't be it.
+fn set_cost(costs: &mut Costs, name: &str, value: f64) -> Result<(), String> {
+    let must = match name {
+        _ if !value.is_finite() => Some("a finite number"),
+        // A time, and a speed
+        "reference gap" if value <= 0.0 => Some("more than 0"),
+        "max speed" if value < 0.0 => Some("0 or more"),
+        _ => None,
+    };
+    if let Some(must) = must {
+        return Err(format!("must be {must}"));
+    }
+    let mut parameters = costs.parameters();
+    let (_, cost) = parameters.iter_mut().find(|(cost, _)| *cost == name).ok_or_else(|| format!("there is no cost called {name}"))?;
+    **cost = value;
+    Ok(())
+}
+
+/// What `analyze` prints.
+#[derive(Serialize)]
+struct Analysis<'a> {
+    title: &'a str,
+    artist: &'a str,
+    difficulty: ChartDifficulty,
+    rating: f64,
+    /// `analyzer_fingerprint` in hex: the same source gives the same statistics
+    analyzer: String,
+    /// Every cost, by name
+    costs: Named,
+    settings: Settings,
+    /// `ChartStatistics::features`, in order
+    features: Named,
+}
+
+/// (name, value) pairs: a JSON object, in their order. A value that isn't finite is null.
+struct Named(Vec<(String, f64)>);
+
+impl Serialize for Named {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in &self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+/// `sim`'s dance-single chart of `difficulty` (any case), analyzed with `costs` and `settings`, as
+/// JSON.
+fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Settings) -> Result<String, String> {
+    let singles: Vec<&SingleChart> = sim
+        .step_charts
+        .iter()
+        .filter_map(|chart| match chart {
+            StepChart::DanceSingle(single) => Some(single),
+            StepChart::DanceDouble(_) => None,
+        })
+        .collect();
+    let name = |chart: &SingleChart| format!("{:?}", chart.difficulty);
+    let matching: Vec<&SingleChart> = singles.iter().copied().filter(|chart| name(chart).eq_ignore_ascii_case(difficulty)).collect();
+    let chart = match matching[..] {
+        [chart] => chart,
+        [] if singles.is_empty() => return Err(format!("{} has no dance-single charts", sim.title)),
+        [] => {
+            let names: Vec<String> = singles.iter().map(|chart| name(chart)).collect();
+            return Err(format!("{} has no {difficulty} chart (it has {})", sim.title, names.join(", ")));
+        }
+        _ => return Err(format!("{} has {} {difficulty} charts", sim.title, matching.len())),
+    };
+    let stats = analyze_single_chart(chart, &sim.bpms, &sim.stops, costs, settings);
+    let mut costs = *costs;
+    let analysis = Analysis {
+        title: &sim.title,
+        artist: &sim.artist,
+        difficulty: chart.difficulty,
+        rating: chart.rating,
+        analyzer: format!("{:016x}", analyzer_fingerprint()),
+        costs: Named(costs.parameters().iter().map(|(name, value)| (name.replace(' ', "_"), **value)).collect()),
+        settings: *settings,
+        features: Named(stats.features()),
+    };
+    serde_json::to_string_pretty(&analysis).map_err(|e| e.to_string())
 }
 
 /// The spreadsheet folder DDR A3 is in.
@@ -962,6 +1137,134 @@ mod tests {
         // What `train` saves is what `infer` compares with
         let names: Vec<String> = ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect();
         assert_eq!(ModelInputs::now(names.clone()).check(&ModelInputs::now(names)), Ok(None));
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn cost_values(mut costs: Costs) -> [f64; 24] {
+        costs.parameters().map(|(_, value)| *value)
+    }
+
+    #[test]
+    fn reads_any_cost_or_setting_from_analyze_arguments() {
+        let args = strings(&[
+            "song.sm",
+            "--jack-base",
+            "0.5",
+            "hard",
+            "--max-speed=3",
+            "--turn-back-degrees",
+            "90",
+            "--doublestep-speed",
+            "-1",
+            "--window-seconds=2.5",
+        ]);
+        let given = analyze_args(&args).unwrap();
+        assert_eq!((given.simfile, given.difficulty), ("song.sm", "hard"));
+        let mut expected = crate::chart_analyzer::COSTS;
+        (expected.jack.base, expected.max_speed, expected.doublestep.speed) = (0.5, 3.0, -1.0);
+        assert_eq!(cost_values(given.costs), cost_values(expected));
+        assert_eq!(given.settings, Settings { turn_back_degrees: 90, window_seconds: 2.5, ..SETTINGS });
+        // None given: the defaults
+        let stdin = strings(&["-", "easy"]);
+        let defaults = analyze_args(&stdin).unwrap();
+        assert_eq!(cost_values(defaults.costs), cost_values(crate::chart_analyzer::COSTS));
+        assert_eq!(defaults.settings, SETTINGS);
+        // Every cost and setting has an option
+        let mut costs = crate::chart_analyzer::COSTS;
+        let names = costs.parameters().map(|(name, _)| name).into_iter().chain(SETTINGS.values().map(|(name, _)| name));
+        for name in names {
+            let flag = option(name);
+            assert!(analyze_args(&strings(&["song.sm", "hard", &flag, "10"])).is_ok(), "{flag}");
+            assert!(analyze_usage().contains(&format!("{flag} ")), "{flag}");
+        }
+
+        let refused = [
+            (&["song.sm"][..], "takes a simfile and a difficulty"),
+            (&["song.sm", "hard", "challenge"], "takes a simfile and a difficulty"),
+            (&["song.sm", "hard", "--jack"], "unknown option --jack"),
+            (&["song.sm", "hard", "--jack-base"], "--jack-base needs a value"),
+            (&["song.sm", "hard", "--jack-base", "x"], "--jack-base takes a number, not x"),
+            (&["song.sm", "hard", "--jack-base", "NaN"], "--jack-base must be a finite number, not NaN"),
+            (&["song.sm", "hard", "--jack-base", "1", "--jack-base=2"], "--jack-base is given twice"),
+            (&["song.sm", "hard", "--reference-gap", "0"], "--reference-gap must be more than 0, not 0"),
+            (&["song.sm", "hard", "--max-speed", "-1"], "--max-speed must be 0 or more, not -1"),
+            (&["song.sm", "hard", "--max-footing-branches", "0"], "--max-footing-branches must be a whole number, 1 or more, not 0"),
+            (&["song.sm", "hard", "--min-drill-notes=2.5"], "--min-drill-notes must be a whole number, 2 or more, not 2.5"),
+            (&["song.sm", "hard", "--window-seconds", "0"], "--window-seconds must be more than 0, not 0"),
+        ];
+        for (args, error) in refused {
+            let message = analyze_args(&strings(args)).unwrap_err();
+            assert!(message.contains(error), "{args:?}: {message}");
+        }
+        assert!(analyze_args(&strings(&["song.sm", "hard", "--max-speed", "0"])).is_ok());
+    }
+
+    #[test]
+    fn analyzes_a_chart_as_json() {
+        let sim = SimFile::from_file("test_resources/footing_stats.sm").unwrap();
+        // The one with the most awkward steps
+        let challenge = sim
+            .step_charts
+            .iter()
+            .find_map(|chart| match chart {
+                StepChart::DanceSingle(single) if single.difficulty == ChartDifficulty::Challenge => Some(single),
+                _ => None,
+            })
+            .unwrap();
+        let doubled = {
+            let mut costs = COSTS;
+            for (name, value) in costs.parameters() {
+                if !matches!(name, "reference gap" | "max speed") {
+                    *value *= 2.0;
+                }
+            }
+            costs
+        };
+        let other_settings = Settings { window_seconds: 2.0, min_stream_notes: 3, max_footing_branches: 7, ..SETTINGS };
+        for (costs, settings) in [(COSTS, SETTINGS), (doubled, other_settings)] {
+            let text = analysis_json(&sim, "cHaLlEnGe", &costs, &settings).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!((json["title"].as_str(), json["difficulty"].as_str()), (Some(sim.title.as_str()), Some("Challenge")));
+            assert_eq!(json["rating"].as_f64(), Some(challenge.rating));
+            assert_eq!(json["analyzer"].as_str(), Some(format!("{:016x}", analyzer_fingerprint()).as_str()));
+            let given: Vec<f64> = json["costs"].as_object().unwrap().values().map(|value| value.as_f64().unwrap()).collect();
+            let mut sorted = costs;
+            let mut by_name: Vec<(String, f64)> = sorted.parameters().iter().map(|(name, value)| (name.replace(' ', "_"), **value)).collect();
+            by_name.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(given, by_name.iter().map(|(_, value)| *value).collect::<Vec<_>>());
+            // Every setting, whole numbers as such
+            for (name, value) in settings.values() {
+                assert_eq!(json["settings"][name.replace(' ', "_")].as_f64(), Some(value), "{name}");
+            }
+            let branches = format!("\"max_footing_branches\": {},", settings.max_footing_branches);
+            assert!(text.contains(&branches), "{branches}");
+
+            // Every statistic, as the analyzer gives it with these costs and settings, in its order
+            let expected = analyze_single_chart(challenge, &sim.bpms, &sim.stops, &costs, &settings).features();
+            let features = &text[text.find("\"features\"").unwrap()..];
+            let mut last = 0;
+            for (name, value) in &expected {
+                let at = features.find(&format!("\"{name}\":")).unwrap_or_else(|| panic!("{name} missing"));
+                assert!(at > last, "{name} out of order");
+                last = at;
+                let found = &json["features"][name];
+                assert_eq!(found.as_f64(), value.is_finite().then_some(*value), "{name}");
+            }
+            assert_eq!(json["features"].as_object().unwrap().len(), expected.len());
+        }
+        // The costs reach the footing: every penalty doubled, the same footing at twice the cost
+        let cost_per_note = |costs: &Costs| {
+            let json: serde_json::Value = serde_json::from_str(&analysis_json(&sim, "challenge", costs, &SETTINGS).unwrap()).unwrap();
+            json["features"]["mean_cost_per_note"].as_f64().unwrap()
+        };
+        let (single, double) = (cost_per_note(&COSTS), cost_per_note(&doubled));
+        assert!(single > 0.0 && (double - 2.0 * single).abs() < 1e-3, "{single} doubled is {double}");
+
+        let none = analysis_json(&sim, "edit", &COSTS, &SETTINGS).unwrap_err();
+        assert!(none.contains("has no edit chart (it has Beginner, Easy, Medium, Hard, Challenge)"), "{none}");
     }
 
     #[test]

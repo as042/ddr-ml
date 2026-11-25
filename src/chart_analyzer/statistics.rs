@@ -14,7 +14,7 @@ pub struct ChartStatistics {
     pub(super) chart_start: f64,
     /// Measures from the first non-empty one to the last
     pub(super) chart_num_measures: usize,
-    /// Fraction of `chart_dur` spent holding, or between notes at most `ACTIVE_GAP_SECONDS` apart
+    /// Fraction of `chart_dur` spent holding, or between notes at most `Settings::active_gap_seconds` apart
     pub(super) chart_active_ratio: f64,
 
     // Basic counts
@@ -59,7 +59,7 @@ pub struct ChartStatistics {
     pub(super) min_notes_per_second: f64,
     /// The most notes in a window of each of `SUSTAINED_SECONDS`, per second
     pub(super) sustained_notes_per_second: [f64; SUSTAINED_SECONDS.len()],
-    // The longest stretch of notes with no break (see `counts::ACTIVE_GAP_SECONDS`)
+    // The longest stretch of notes with no break (see `Settings::active_gap_seconds`)
     pub(super) longest_run_notes: usize,
     pub(super) longest_run_seconds: f64,
 

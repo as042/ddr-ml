@@ -10,7 +10,7 @@ pub enum Technique {
     RepeatedArrow,
     /// 2+ arrows at once
     Jump,
-    /// `sequences::MIN_STREAM_NOTES` or more evenly spaced notes
+    /// `Settings::min_stream_notes` or more evenly spaced notes
     Stream,
     /// A note under a hold or roll that started on an earlier note
     HeldStep,
@@ -206,21 +206,20 @@ pub fn speed(gap: f64) -> f64 {
     if gap > TIME_EPSILON { 1.0 / gap } else { 0.0 }
 }
 
-/// Gaps are even if the longest is this fraction longer than the shortest, at most.
-const EVEN_TOLERANCE: f64 = 0.1;
-
-pub fn even(shortest: f64, longest: f64) -> bool {
-    longest <= shortest * (1.0 + EVEN_TOLERANCE) + TIME_EPSILON
+/// Gaps are even if the longest is `tolerance` longer than the shortest, as a fraction, at most.
+pub fn even(shortest: f64, longest: f64, tolerance: f64) -> bool {
+    longest <= shortest * (1.0 + tolerance) + TIME_EPSILON
 }
 
-/// Runs of evenly spaced notes, each as long as it goes, as (first note, notes). A run may start
-/// on the last note of the one before.
+/// Runs of evenly spaced notes (see `even`), each as long as it goes, as (first note, notes). A
+/// run may start on the last note of the one before.
 ///
 /// `links(i)`: note `i` can follow note `i - 1` in a run. `extends(first, i)`: note `i` can join
 /// the run from `first` that reaches note `i - 1`.
 pub fn even_runs(
     segment: &[TimedNote],
     min_notes: usize,
+    tolerance: f64,
     links: impl Fn(usize) -> bool,
     extends: impl Fn(usize, usize) -> bool,
 ) -> Vec<(usize, usize)> {
@@ -233,7 +232,7 @@ pub fn even_runs(
         let linked = i < notes && links(i);
         if linked {
             let (shorter, longer) = (shortest.min(gap(i)), longest.max(gap(i)));
-            if extends(first, i) && even(shorter, longer) {
+            if extends(first, i) && even(shorter, longer, tolerance) {
                 (shortest, longest) = (shorter, longer);
                 continue;
             }
@@ -248,8 +247,11 @@ pub fn even_runs(
 
 #[cfg(test)]
 mod tests {
+    use super::super::SETTINGS;
     use super::super::footing::tests::segment;
     use super::*;
+
+    const TOLERANCE: f64 = SETTINGS.even_tolerance;
 
     #[test]
     fn lists_every_technique_once_in_order() {
@@ -314,14 +316,16 @@ mod tests {
         let all = |_: usize, _: usize| true;
         // 5 notes 0.125 s apart, then 3 more 0.25 s apart, sharing a note
         let notes = segment("L D U R L . D . U . R");
-        assert_eq!(even_runs(&notes, 2, any, all), [(0, 5), (4, 4)]);
-        assert_eq!(even_runs(&notes, 5, any, all), [(0, 5)]);
-        assert_eq!(even_runs(&notes, 6, any, all), []);
+        assert_eq!(even_runs(&notes, 2, TOLERANCE, any, all), [(0, 5), (4, 4)]);
+        // Twice the gap is even enough at a tolerance of 1
+        assert_eq!(even_runs(&notes, 2, 1.0, any, all), [(0, 8)]);
+        assert_eq!(even_runs(&notes, 5, TOLERANCE, any, all), [(0, 5)]);
+        assert_eq!(even_runs(&notes, 6, TOLERANCE, any, all), []);
         // A note that can't follow the one before starts a new run
-        assert_eq!(even_runs(&notes, 2, |i| i != 2, all), [(0, 2), (2, 3), (4, 4)]);
+        assert_eq!(even_runs(&notes, 2, TOLERANCE, |i| i != 2, all), [(0, 2), (2, 3), (4, 4)]);
         // One that can't join the run so far starts one from the note before
-        assert_eq!(even_runs(&notes, 2, any, |first, i| i - first < 3), [(0, 3), (2, 3), (4, 3), (6, 2)]);
-        assert_eq!(even_runs(&notes[..1], 1, any, all), [(0, 1)]);
-        assert_eq!(even_runs(&[], 1, any, all), []);
+        assert_eq!(even_runs(&notes, 2, TOLERANCE, any, |first, i| i - first < 3), [(0, 3), (2, 3), (4, 3), (6, 2)]);
+        assert_eq!(even_runs(&notes[..1], 1, TOLERANCE, any, all), [(0, 1)]);
+        assert_eq!(even_runs(&[], 1, TOLERANCE, any, all), []);
     }
 }

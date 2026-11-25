@@ -1,16 +1,13 @@
 //! Techniques found from the notes alone, whatever the feet do.
 
 use super::technique::{Occurrence, Technique, even_runs};
-use super::{TIME_EPSILON, TimedNote, arrows, steps_on};
-
-/// Fewest notes in a stream.
-pub const MIN_STREAM_NOTES: usize = 8;
+use super::{Settings, TIME_EPSILON, TimedNote, arrows, steps_on};
 
 /// The repeated arrows, jumps and held steps of `segment`, each on its note, and its streams,
 /// each on its first: a stream is a run of evenly spaced notes as long as it goes, so a change
-/// of rhythm ends it, and the next may start on its last note. A held step is under a hold from
-/// earlier in the segment.
-pub fn find(segment: &[TimedNote]) -> Vec<Occurrence> {
+/// of rhythm ends it, and the next may start on its last note (see `Settings::min_stream_notes`
+/// and `Settings::even_tolerance`). A held step is under a hold from earlier in the segment.
+pub fn find(segment: &[TimedNote], settings: &Settings) -> Vec<Occurrence> {
     let mut found = Vec::new();
     // When the last of the holds so far ends
     let mut held_until = f64::NEG_INFINITY;
@@ -27,7 +24,7 @@ pub fn find(segment: &[TimedNote]) -> Vec<Occurrence> {
         held_until = segment[i].hold_ends.iter().flatten().fold(held_until, |until, &end| until.max(end));
     }
     let apart = |i: usize| segment[i].time - segment[i - 1].time > TIME_EPSILON;
-    for (first, notes) in even_runs(segment, MIN_STREAM_NOTES, apart, |_, _| true) {
+    for (first, notes) in even_runs(segment, settings.min_stream_notes, settings.even_tolerance, apart, |_, _| true) {
         found.push(Occurrence::over(Technique::Stream, segment, first, notes));
     }
     found
@@ -40,7 +37,7 @@ fn shares_an_arrow(a: &TimedNote, b: &TimedNote) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::footing::tests::segment;
-    use super::super::{TEST_COSTS, foot_arrows};
+    use super::super::{SETTINGS, TEST_COSTS, foot_arrows};
     use super::*;
     use crate::sim_loader::Note;
 
@@ -50,7 +47,7 @@ mod tests {
     }
 
     fn found_in(notes: &[TimedNote], technique: Technique) -> Vec<(usize, usize, f64)> {
-        find(notes)
+        find(notes, &SETTINGS)
             .into_iter()
             .filter(|occurrence| occurrence.technique == technique)
             .map(|occurrence| (occurrence.note, occurrence.notes, occurrence.speed))

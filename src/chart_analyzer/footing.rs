@@ -6,7 +6,7 @@
 //! Each kind of event has its own penalty and its own growth with speed (see `Cost`).
 //!
 //! The tree grows a note at a time. Branches that reach the same position at the same note merge
-//! (see `Key`): only the cheapest goes on. If more than `max_width` are left, the costliest are
+//! (see `Key`): only the cheapest goes on. If more than `Settings::max_footing_branches` are left, the costliest are
 //! dropped and the footing may not be the cheapest.
 //!
 //! A segment starts with the feet at home, left foot on Left and right foot on Right. Positions
@@ -16,7 +16,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::ops::AddAssign;
 
 use super::technique::{Occurrence, Technique, gaps};
-use super::{TIME_EPSILON, TimedNote, steps_on};
+use super::{Settings, TIME_EPSILON, TimedNote, steps_on};
 
 pub mod moves;
 pub mod patterns;
@@ -133,11 +133,8 @@ impl Stance {
     }
 }
 
-/// Degrees a turn can go back from its furthest point and still be one turn.
-const TURN_BACK_DEGREES: i32 = 45;
-
 /// Tracks the player's facing through a segment, to count spins. A turn goes one way, give or take
-/// `TURN_BACK_DEGREES`.
+/// `turn_back`.
 #[derive(Clone, Copy)]
 struct Turning {
     /// Facing, unwrapped (405 is a full clockwise turn plus 45), or None while unknown
@@ -148,12 +145,14 @@ struct Turning {
     direction: i32,
     /// Furthest angle the current turn has reached
     peak: i32,
+    /// Degrees a turn can go back from its peak and still be one turn (see `Settings`)
+    turn_back: i32,
 }
 
 impl Turning {
-    fn new(facing: Option<i32>) -> Self {
+    fn new(facing: Option<i32>, turn_back: i32) -> Self {
         let start = facing.unwrap_or(0);
-        Turning { angle: facing, turn_start: start, direction: 0, peak: start }
+        Turning { angle: facing, turn_start: start, direction: 0, peak: start, turn_back }
     }
 
     /// Current facing, wrapped.
@@ -166,7 +165,7 @@ impl Turning {
         let (Some(angle), Some(facing)) = (self.angle, facing) else {
             // Losing track ends the turn. Finding the feet again starts a new one.
             self.finish(footing);
-            *self = Turning::new(facing);
+            *self = Turning::new(facing, self.turn_back);
             return;
         };
         let mut delta = wrap(facing - angle);
@@ -183,7 +182,7 @@ impl Turning {
             (self.direction, self.peak) = (delta.signum(), angle);
         } else if (angle - self.peak) * self.direction > 0 {
             self.peak = angle;
-        } else if (self.peak - angle) * self.direction > TURN_BACK_DEGREES {
+        } else if (self.peak - angle) * self.direction > self.turn_back {
             // The turn ended at its peak. The next runs back from there.
             let direction = self.direction;
             self.finish(footing);
@@ -509,8 +508,8 @@ pub struct Solution {
     /// One per note
     pub steps: Vec<Step>,
     /// Each event, on the note whose step adds it, and each pattern, on its first note, in note
-    /// order. A spin is where its turn ends: the note that turns back past `TURN_BACK_DEGREES`, or
-    /// the last.
+    /// order. A spin is where its turn ends: the note that turns back past
+    /// `Settings::turn_back_degrees`, or the last.
     pub occurrences: Vec<Occurrence>,
     pub events: Events,
     /// The events' penalties, each at its speed
@@ -572,14 +571,15 @@ struct State {
 }
 
 impl State {
-    fn home() -> State {
+    /// `turn_back`: see `Settings::turn_back_degrees`.
+    fn home(turn_back: i32) -> State {
         let on = [bit(LEFT_ARROW), bit(RIGHT_ARROW)];
         State {
             on,
             held_until: [f64::NEG_INFINITY; 4],
             last: Last::Nothing,
             stance: Stance::of(facing_of(on)),
-            turning: Turning::new(facing_of(on)),
+            turning: Turning::new(facing_of(on), turn_back),
             events: Events::default(),
             cost: 0,
         }
@@ -782,15 +782,17 @@ struct Branch {
 }
 
 /// The cheapest footing of a segment starting from home. Among equally cheap ones, the one that
-/// keeps to the usual foot longest.
-pub fn solve(segment: &[TimedNote], costs: &Costs, max_width: usize) -> Solution {
-    search(segment, costs, max_width, true)
+/// keeps to the usual foot longest. `settings`: the search's width and turning, and the
+/// patterns' thresholds.
+pub fn solve(segment: &[TimedNote], costs: &Costs, settings: &Settings) -> Solution {
+    search(segment, costs, settings, true)
 }
 
-fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -> Solution {
+fn search(segment: &[TimedNote], costs: &Costs, settings: &Settings, merge: bool) -> Solution {
+    let max_width = settings.max_footing_branches;
     // Branches after each note. Kept in the order of their steps, usual before unusual, so the
     // first of equals is the more usual.
-    let mut layer = vec![State::home()];
+    let mut layer = vec![State::home(settings.turn_back_degrees)];
     // Per note: each branch's (parent, step)
     let mut links: Vec<Vec<(usize, Step)>> = Vec::with_capacity(segment.len());
     let (mut nodes, mut merged, mut widest, mut exact) = (0, 0, 1, true);
@@ -860,7 +862,7 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
     steps.reverse();
 
     // Describe the winning footing: events and costs per note, occurrences, patterns and moves
-    let (step_events, kinds) = replay(segment, &steps, &events);
+    let (step_events, kinds) = replay(segment, &steps, &events, settings.turn_back_degrees);
     let mut occurrences: Vec<Occurrence> = Vec::new();
     for (i, added) in step_events.iter().enumerate() {
         for (technique, count) in added.counts() {
@@ -868,7 +870,7 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
         }
     }
     occurrences.extend(kinds.into_iter().map(|(i, kind)| Occurrence::at(kind, segment, i)));
-    occurrences.extend(patterns::find(segment, &steps, &step_events));
+    occurrences.extend(patterns::find(segment, &steps, &step_events, settings));
     // Stable: a note's events stay before their kinds, and those before its patterns
     occurrences.sort_by_key(|occurrence| occurrence.note);
     let note_costs: Vec<u64> = step_events.iter().enumerate().map(|(i, added)| added.cost_at(costs, segment, i)).collect();
@@ -881,9 +883,9 @@ fn search(segment: &[TimedNote], costs: &Costs, max_width: usize, merge: bool) -
 
 /// Replays `steps` for the events each adds, and for which kind each vertical footswitch and
 /// horizontal crossover is (see `Technique::kinds`), as (note, kind). `total`: the events once
-/// the last turn has ended.
-fn replay(segment: &[TimedNote], steps: &[Step], total: &Events) -> (Vec<Events>, Vec<(usize, Technique)>) {
-    let mut state = State::home();
+/// the last turn has ended. `turn_back`: the search's.
+fn replay(segment: &[TimedNote], steps: &[Step], total: &Events, turn_back: i32) -> (Vec<Events>, Vec<(usize, Technique)>) {
+    let mut state = State::home(turn_back);
     // Per foot: the arrows it is on or was last on, and those it came there from
     let (mut stands, mut came_from) = (state.on, state.on);
     let (mut added, mut kinds) = (Vec::with_capacity(steps.len()), Vec::new());
@@ -930,7 +932,7 @@ fn replay(segment: &[TimedNote], steps: &[Step], total: &Events) -> (Vec<Events>
 pub(super) mod tests {
     use super::*;
     use crate::chart_analyzer::technique::Source;
-    use crate::chart_analyzer::{Timing, to_timed_notes};
+    use crate::chart_analyzer::{SETTINGS, Timing, to_timed_notes};
     use crate::sim_loader::{BPMChange, Measure, Note};
 
     /// A segment from tokens 0.125 s apart, one row each: `L`, `D`, `U`, `R` for taps (`LR` is a
@@ -982,7 +984,8 @@ pub(super) mod tests {
 
 
     const COSTS: Costs = TEST_COSTS;
-    const WIDTH: usize = 1_000_000;
+    /// Wide enough for any test to be exact
+    pub(in crate::chart_analyzer) const WIDE: Settings = Settings { max_footing_branches: 1_000_000, ..SETTINGS };
 
     /// `costs` with every penalty what it is at the reference speed, at any speed.
     fn flat(costs: &Costs) -> Costs {
@@ -1074,12 +1077,12 @@ pub(super) mod tests {
 
     fn solved(tokens: &str, costs: &Costs) -> (String, Events) {
         let notes = segment(tokens);
-        let solution = solve(&notes, costs, WIDTH);
+        let solution = solve(&notes, costs, &WIDE);
         assert!(solution.exact, "{tokens}: branches dropped");
         // `segment` spaces notes at the reference gap
         assert_eq!(solution.cost, solution.events.cost(costs, 1.0, 1.0) as f64 / COST_UNIT, "{tokens}: cost");
         let mut added = Events::default();
-        for events in replay(&notes, &solution.steps, &solution.events).0 {
+        for events in replay(&notes, &solution.steps, &solution.events, WIDE.turn_back_degrees).0 {
             added += events;
         }
         assert_eq!(added, solution.events, "{tokens}: events step by step");
@@ -1159,8 +1162,8 @@ pub(super) mod tests {
     /// Unwrapped facing (see `Turning`) after each note of the cheapest footing.
     fn facings(tokens: &str, costs: &Costs) -> Vec<i32> {
         let notes = segment(tokens);
-        let mut state = State::home();
-        solve(&notes, costs, WIDTH)
+        let mut state = State::home(WIDE.turn_back_degrees);
+        solve(&notes, costs, &WIDE)
             .steps
             .iter()
             .enumerate()
@@ -1209,14 +1212,14 @@ pub(super) mod tests {
         assert_eq!(Cost { base: 1.0, speed: 7.0 }.at(0.5), 4500);
 
         // The same crossover at other speeds: its base, plus its speed scaling
-        let crossover = |times: f64| solve(&at_speed("L D R D L", times), &COSTS, WIDTH).cost;
+        let crossover = |times: f64| solve(&at_speed("L D R D L", times), &COSTS, &WIDE).cost;
         assert_eq!(crossover(1.0), COSTS.horizontal_crossover.base + COSTS.horizontal_crossover.speed);
         assert_eq!(crossover(2.0), COSTS.horizontal_crossover.base + COSTS.horizontal_crossover.speed * 2.0);
         assert_eq!(crossover(0.25), COSTS.horizontal_crossover.base + COSTS.horizontal_crossover.speed * 0.25);
-        assert_eq!(solve(&at_speed("L D R D L", 2.0), &flat(&COSTS), WIDTH).cost, crossover(1.0));
+        assert_eq!(solve(&at_speed("L D R D L", 2.0), &flat(&COSTS), &WIDE).cost, crossover(1.0));
 
         // A crossover is no cheaper for a pause before it, if the next note comes fast
-        let paused = solve(&segment("L D . . . R D L"), &COSTS, WIDTH);
+        let paused = solve(&segment("L D . . . R D L"), &COSTS, &WIDE);
         assert_eq!((paused.events, paused.cost), (events(0, 0, 1, 0, 0, 0, 0), crossover(1.0)));
         // Nor a crossed jump for starting a segment
         assert_eq!(solved("LU UR", &COSTS).1, events(0, 1, 0, 0, 0, 0, 0));
@@ -1225,7 +1228,7 @@ pub(super) mod tests {
     #[test]
     fn speed_decides_between_jacks_and_footswitches() {
         let footing = |times: f64| {
-            let solution = solve(&at_speed("U U U U", times), &COSTS, WIDTH);
+            let solution = solve(&at_speed("U U U U", times), &COSTS, &WIDE);
             (feet(&solution), solution.events)
         };
         // One foot can repeat an arrow up to a point
@@ -1240,7 +1243,7 @@ pub(super) mod tests {
     fn speed_decides_between_a_crossover_and_a_doublestep() {
         // A doublestep costs little slow and a lot fast, a crossover much the same
         let footing = |times: f64| {
-            let solution = solve(&at_speed("R L U R U R", times), &COSTS, WIDTH);
+            let solution = solve(&at_speed("R L U R U R", times), &COSTS, &WIDE);
             (feet(&solution), solution.events)
         };
         assert_eq!(footing(2.0), ("rlrlrl".into(), events(0, 0, 1, 0, 0, 0, 0)));
@@ -1248,19 +1251,24 @@ pub(super) mod tests {
         assert_eq!(footing(0.25), ("rlrrlr".into(), events(0, 0, 0, 1, 0, 0, 0)));
         // Without speed scaling, a crossover at any speed
         let flat = flat(&COSTS);
-        assert_eq!(feet(&solve(&at_speed("R L U R U R", 0.25), &flat, WIDTH)), "rlrlrl");
+        assert_eq!(feet(&solve(&at_speed("R L U R U R", 0.25), &flat, &WIDE)), "rlrlrl");
 
         // After a pause, a doublestep onto Up rather than the crossover that would follow
-        let paused = solve(&segment("R L . . . U R U R"), &COSTS, WIDTH);
+        let paused = solve(&segment("R L . . . U R U R"), &COSTS, &WIDE);
         assert_eq!((feet(&paused), paused.events), ("rllrlr".into(), events(0, 0, 0, 1, 0, 0, 0)));
         assert_eq!(paused.cost, COSTS.doublestep.base + COSTS.doublestep.speed * 0.25);
-        assert_eq!(feet(&solve(&segment("R L . . . U R U R"), &flat, WIDTH)), "rlrlrl");
+        assert_eq!(feet(&solve(&segment("R L . . . U R U R"), &flat, &WIDE)), "rlrlrl");
     }
 
     /// Facing each way in turn from the screen, then the turn ended: (full spins, half spins) and
     /// the angle.
     fn turned(facings: &[i32]) -> ((usize, usize), Option<i32>) {
-        let (mut turning, mut footing) = (Turning::new(Some(0)), Footing::default());
+        turned_back(facings, SETTINGS.turn_back_degrees)
+    }
+
+    /// `turned`, with turns going back up to `turn_back` degrees.
+    fn turned_back(facings: &[i32], turn_back: i32) -> ((usize, usize), Option<i32>) {
+        let (mut turning, mut footing) = (Turning::new(Some(0), turn_back), Footing::default());
         for &facing in facings {
             turning.face(Some(facing), &mut footing);
         }
@@ -1289,17 +1297,20 @@ pub(super) mod tests {
         assert_eq!(turned(&[-90, 180, -135, 135, 45, -45]), ((1, 0), Some(-405)));
         // 90 back at 180, then 90 forward again: three turns
         assert_eq!(turned(&[90, 180, 90, 180, -90, 0, 90]), ((1, 1), Some(450)));
+        // None allowed back: 45 back ends a turn too. Up to 90 allowed: 90 back doesn't.
+        assert_eq!(turned_back(&[90, 180, 135, -135, -45, 45], 0), ((0, 2), Some(405)));
+        assert_eq!(turned_back(&[90, 180, 90, 180, -90, 0, 90], 90), ((1, 0), Some(450)));
     }
 
     #[test]
     fn says_which_step_each_event_is_on() {
         // Notes 0.125 s apart: 8 a second
-        let crossover = solve(&segment("L D R D L"), &COSTS, WIDTH);
+        let crossover = solve(&segment("L D R D L"), &COSTS, &WIDE);
         let on_right = |technique| Occurrence { technique, note: 2, notes: 1, speed: 8.0 };
         assert_eq!(crossover.occurrences, [on_right(Technique::HorizontalCrossover), on_right(Technique::FullCrossover)]);
         // The spin is counted on the last note
         let spinner = Costs { doublestep: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
-        let spin = solve(&segment("L D R U L D"), &spinner, WIDTH);
+        let spin = solve(&segment("L D R U L D"), &spinner, &WIDE);
         assert_eq!(found_on(&spin, 2), [(Technique::HorizontalCrossover, 8.0), (Technique::FullCrossover, 8.0)]);
         assert_eq!(found_on(&spin, 5), [(Technique::VerticalCrossover, 8.0), (Technique::FullSpin, 8.0)]);
     }
@@ -1308,7 +1319,7 @@ pub(super) mod tests {
     fn tells_up_footswitches_from_down() {
         let no_jacks = Costs { jack: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
         let kinds = |tokens: &str, costs: &Costs| {
-            let solution = solve(&segment(tokens), costs, WIDTH);
+            let solution = solve(&segment(tokens), costs, &WIDE);
             let kinds: Vec<(usize, Technique)> = solution
                 .occurrences
                 .iter()
@@ -1327,7 +1338,7 @@ pub(super) mod tests {
         assert_eq!(kinds("L L", &no_jacks), []);
         assert_eq!(kinds("U U", &COSTS), []);
         // Timed as the footswitch it is
-        let switched = solve(&segment("L D . D R"), &COSTS, WIDTH);
+        let switched = solve(&segment("L D . D R"), &COSTS, &WIDE);
         assert_eq!(found_on(&switched, 2), [(Technique::VerticalFootswitch, 4.0), (Technique::DownFootswitch, 4.0)]);
     }
 
@@ -1335,7 +1346,7 @@ pub(super) mod tests {
     fn tells_full_crossovers_from_half() {
         let costs = Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
         let kinds = |tokens: &str| {
-            let solution = solve(&segment(tokens), &costs, WIDTH);
+            let solution = solve(&segment(tokens), &costs, &WIDE);
             let kinds: Vec<(usize, Technique)> = Technique::HorizontalCrossover
                 .kinds()
                 .iter()
@@ -1363,15 +1374,15 @@ pub(super) mod tests {
         // The crossover onto Right: 0.25 s after Down, 0.125 s before the next. A position goes
         // by the shorter gap.
         let costs = Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
-        let crossover = solve(&segment("L D . R D L"), &costs, WIDTH);
+        let crossover = solve(&segment("L D . R D L"), &costs, &WIDE);
         assert_eq!(found_on(&crossover, 2), [(Technique::HorizontalCrossover, 8.0), (Technique::FullCrossover, 8.0)]);
-        let slow = solve(&segment("L D . R . D L"), &costs, WIDTH);
+        let slow = solve(&segment("L D . R . D L"), &costs, &WIDE);
         assert_eq!(found_on(&slow, 2), [(Technique::HorizontalCrossover, 4.0), (Technique::FullCrossover, 4.0)]);
         // A step goes by the gap before it
-        let doublestep = solve(&segment("L . . . D . . . R D"), &COSTS, WIDTH);
+        let doublestep = solve(&segment("L . . . D . . . R D"), &COSTS, &WIDE);
         assert_eq!(found_on(&doublestep, 2), [(Technique::Doublestep, 2.0)]);
         // A repeated jump: two jacks on one note
-        let jumps = solve(&segment("LR . LR"), &COSTS, WIDTH);
+        let jumps = solve(&segment("LR . LR"), &COSTS, &WIDE);
         assert_eq!(found_on(&jumps, 1), [(Technique::Jack, 4.0), (Technique::Jack, 4.0)]);
         assert_eq!(jumps.count(Technique::Jack), 2);
     }
@@ -1379,20 +1390,20 @@ pub(super) mod tests {
     #[test]
     fn costs_each_note() {
         // Slow enough to doublestep onto Right, 0.5 s after Down
-        let doublestep = solve(&segment("L . . . D . . . R"), &COSTS, WIDTH);
+        let doublestep = solve(&segment("L . . . D . . . R"), &COSTS, &WIDE);
         assert_eq!(feet(&doublestep), "lrr");
         let cost = COSTS.doublestep.base + COSTS.doublestep.speed * 0.25;
         assert_eq!(doublestep.note_costs, [0.0, 0.0, cost]);
         assert_eq!(doublestep.cost, cost);
         // A repeated jump: both jacks on its note
-        let jumps = solve(&segment("LR . LR"), &COSTS, WIDTH);
+        let jumps = solve(&segment("LR . LR"), &COSTS, &WIDE);
         assert_eq!(jumps.note_costs, [0.0, 2.0 * COSTS.jack.speed * 0.5]);
         // A spin is paid where its turn ends
-        let spin = solve(&segment("L D R U L D"), &Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS }, WIDTH);
+        let spin = solve(&segment("L D R U L D"), &Costs { doublestep: Cost { base: 100.0, speed: 0.0 }, ..COSTS }, &WIDE);
         assert_eq!(spin.count(Technique::FullSpin), 1);
         assert_eq!(spin.note_costs.iter().sum::<f64>(), spin.cost);
         assert_eq!(spin.note_costs.len(), 6);
-        assert!(solve(&[], &COSTS, WIDTH).note_costs.is_empty());
+        assert!(solve(&[], &COSTS, &WIDE).note_costs.is_empty());
     }
 
     #[test]
@@ -1406,14 +1417,14 @@ pub(super) mod tests {
         // Down can't be bracketed with Up, and not with Right at this cost
         let costs = Costs { bracket: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
         let footing = |times: f64| {
-            let solution = solve(&at_speed("D+ R U R U D-", times), &costs, WIDTH);
+            let solution = solve(&at_speed("D+ R U R U D-", times), &costs, &WIDE);
             (feet(&solution), solution.events)
         };
         // Slow: the right foot takes every note under the left's hold
         assert_eq!(footing(1.0), ("lrrrr".into(), events(0, 0, 0, 3, 0, 0, 0)));
         // Fast: the feet take turns, the one that stepped last taking the hold over
         assert_eq!(footing(4.0), ("lrl*r*l*".into(), switched(3, Events::default())));
-        let fast = solve(&at_speed("D+ R U R U D-", 4.0), &costs, WIDTH);
+        let fast = solve(&at_speed("D+ R U R U D-", 4.0), &costs, &WIDE);
         assert_eq!(fast.cost, 3.0 * (costs.freeze_switch.base + costs.freeze_switch.speed * 4.0));
         assert_eq!(found_on(&fast, 2), [(Technique::FreezeSwitch, 32.0)]);
         // Each switch moves both feet: one onto the note, the other onto the hold
@@ -1422,20 +1433,20 @@ pub(super) mod tests {
 
         // Never, at a price
         let never = Costs { freeze_switch: Cost { base: 1000.0, speed: 0.0 }, ..costs };
-        assert_eq!(feet(&solve(&at_speed("D+ R U R U D-", 4.0), &never, WIDTH)), "lrrrr");
+        assert_eq!(feet(&solve(&at_speed("D+ R U R U D-", 4.0), &never, &WIDE)), "lrrrr");
     }
 
     #[test]
     fn a_freeze_switch_leaves_the_other_foot_holding() {
         let costs = Costs { bracket: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
         // The left foot leaves Down to the right for Up, then is the one free to jack it
-        let solution = solve(&at_speed("D+ R U U U D-", 4.0), &costs, WIDTH);
+        let solution = solve(&at_speed("D+ R U U U D-", 4.0), &costs, &WIDE);
         assert_eq!((feet(&solution), solution.events), ("lrl*ll".into(), switched(1, events(2, 0, 0, 0, 0, 0, 0))));
         let step = solution.steps[2];
         assert_eq!((step.foot(UP_ARROW), step.regrabber(DOWN_ARROW)), (Some(Foot::Left), Some(Foot::Right)));
         assert_eq!(solution.steps[3].regrabber(DOWN_ARROW), None);
         // Not once the hold is over
-        let over = solve(&at_speed("D+ . D- R U R U", 4.0), &costs, WIDTH);
+        let over = solve(&at_speed("D+ . D- R U R U", 4.0), &costs, &WIDE);
         assert_eq!((feet(&over), over.events), ("lrlrl".into(), candled(1, Events::default())));
     }
 
@@ -1473,7 +1484,7 @@ pub(super) mod tests {
         let cheap_sides = Costs { sideswitch: Cost { base: 0.5, speed: 0.0 }, ..COSTS };
         assert_eq!(solved("L L", &cheap_sides), ("lr".into(), side));
         assert_eq!(solved("U U", &cheap_sides), ("ll".into(), events(1, 0, 0, 0, 0, 0, 0)));
-        assert_eq!(solve(&segment("L L"), &cheap_sides, WIDTH).cost, 0.5);
+        assert_eq!(solve(&segment("L L"), &cheap_sides, &WIDE).cost, 0.5);
     }
 
     #[test]
@@ -1487,7 +1498,7 @@ pub(super) mod tests {
         assert_eq!(solved("U D U D", &COSTS).1, Events::default());
         // On a doublestep too: the right foot under the left's hold
         let costs = Costs { bracket: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
-        let held = solve(&segment("L+ U D L-"), &costs, WIDTH);
+        let held = solve(&segment("L+ U D L-"), &costs, &WIDE);
         assert_eq!(feet(&held), "lrr");
         assert_eq!(found_on(&held, 2), [(Technique::VerticalCrossover, 8.0), (Technique::Doublestep, 8.0)]);
         // Not once the other foot has taken its arrow
@@ -1495,7 +1506,7 @@ pub(super) mod tests {
         assert_eq!(solved("U U D", &no_jacks), ("lrl".into(), events(0, 1, 0, 0, 0, 0, 0)));
         // Its own cost: paid, or avoided if anything else is cheaper
         let dear = Costs { vertical_crossover: Cost { base: 2.0, speed: 0.5 }, ..COSTS };
-        assert_eq!(solve(&segment("U L D"), &dear, WIDTH).cost, 2.5);
+        assert_eq!(solve(&segment("U L D"), &dear, &WIDE).cost, 2.5);
         let dearer = Costs { vertical_crossover: Cost { base: 20.0, speed: 0.0 }, ..COSTS };
         assert_eq!(solved("U L D", &dearer).1.vertical_crossovers, 0);
     }
@@ -1503,7 +1514,7 @@ pub(super) mod tests {
     #[test]
     fn a_foot_turning_on_an_arrow_it_keeps_doesnt_cross() {
         let note = |tokens: &str| segment(tokens)[0];
-        let on = |left: Arrows, right: Arrows| State { on: [left, right], ..State::home() };
+        let on = |left: Arrows, right: Arrows| State { on: [left, right], ..State::home(SETTINGS.turn_back_degrees) };
         let step = |feet: [Arrows; 2]| Step { feet, regrabs: [0, 0] };
         let (left, down, up, right) = (bit(LEFT_ARROW), bit(DOWN_ARROW), bit(UP_ARROW), bit(RIGHT_ARROW));
         let crossed = |state: State, feet: [Arrows; 2]| state.step(&note("D"), step(feet), 0).unwrap().events.vertical_crossovers;
@@ -1524,9 +1535,9 @@ pub(super) mod tests {
     #[test]
     fn brackets_three_or_four_arrows() {
         // One foot takes two arrows next to each other, without crossing the feet
-        let three = solve(&segment("R LDU"), &COSTS, WIDTH);
+        let three = solve(&segment("R LDU"), &COSTS, &WIDE);
         assert_eq!((feet(&three), three.events), ("r[LD|U]".into(), bracketed(1, Events::default())));
-        let four = solve(&segment("R LDUR"), &COSTS, WIDTH);
+        let four = solve(&segment("R LDUR"), &COSTS, &WIDE);
         assert_eq!(four.events, bracketed(2, events(1, 0, 0, 0, 0, 0, 0)));
         assert!(["r[LD|UR]", "r[LU|DR]"].contains(&feet(&four).as_str()), "{}", feet(&four));
         // Left and Right aren't next to each other, nor Down and Up
@@ -1538,13 +1549,13 @@ pub(super) mod tests {
     #[test]
     fn brackets_when_the_feet_are_holding() {
         // Both feet hold: one keeps its hold and takes Up as well
-        let tap = solve(&segment("L+ R+ U L- R-"), &COSTS, WIDTH);
+        let tap = solve(&segment("L+ R+ U L- R-"), &COSTS, &WIDE);
         assert_eq!((feet(&tap), tap.events), ("lrl".into(), bracketed(1, Events::default())));
         // The left foot holds through a jump: it can't leave for one of the jump's arrows
-        let jump = solve(&segment("L+ . UR L-"), &COSTS, WIDTH);
+        let jump = solve(&segment("L+ . UR L-"), &COSTS, &WIDE);
         assert_eq!(jump.events, bracketed(1, Events::default()));
         assert!(["l[U|R]", "l[|UR]"].contains(&feet(&jump).as_str()), "{}", feet(&jump));
-        let apart = solve(&segment("L+ . DU L-"), &COSTS, WIDTH);
+        let apart = solve(&segment("L+ . DU L-"), &COSTS, &WIDE);
         assert_eq!(apart.events.brackets, 1);
         assert!(["l[U|D]", "l[D|U]"].contains(&feet(&apart).as_str()), "{}", feet(&apart));
     }
@@ -1557,7 +1568,7 @@ pub(super) mod tests {
         let cheap = Costs { bracket: Cost { base: 0.5, speed: 0.0 }, ..COSTS };
         assert_eq!(solved("UR LU", &cheap), ("[U|R][LU|]".into(), bracketed(1, events(1, 0, 0, 0, 0, 0, 0))));
         // The cost: mostly base
-        let bracket = solve(&segment("UR LU"), &cheap, WIDTH).cost - COSTS.jack.base - COSTS.jack.speed;
+        let bracket = solve(&segment("UR LU"), &cheap, &WIDE).cost - COSTS.jack.base - COSTS.jack.speed;
         assert_eq!(bracket, 0.5);
         assert!(COSTS.bracket.base > COSTS.bracket.speed);
     }
@@ -1579,8 +1590,8 @@ pub(super) mod tests {
         let mut merged = 0;
         for pattern in patterns {
             let notes = segment(&pattern);
-            let whole_tree = search(&notes, &COSTS, WIDTH, false);
-            let merging = solve(&notes, &COSTS, WIDTH);
+            let whole_tree = search(&notes, &COSTS, &WIDE, false);
+            let merging = solve(&notes, &COSTS, &WIDE);
             assert!(whole_tree.exact && merging.exact, "{pattern}: branches dropped");
             assert_eq!(whole_tree.merged, 0);
             assert_eq!((merging.cost, &merging.steps), (whole_tree.cost, &whole_tree.steps), "{pattern}");
@@ -1594,18 +1605,18 @@ pub(super) mod tests {
     fn merging_keeps_long_segments_small() {
         // 400 notes of crossovers, jacks, footswitches and spins: 2^400 branches unmerged
         let pattern = "L D R D L U U R L D R U L D D R U L R D ".repeat(20);
-        let solution = solve(&segment(&pattern), &COSTS, 1000);
+        let solution = solve(&segment(&pattern), &COSTS, &Settings { max_footing_branches: 1000, ..SETTINGS });
         assert!(solution.exact);
         assert!(solution.widest < 200);
     }
 
     #[test]
     fn drops_the_costliest_branches_past_the_width() {
-        let one_branch = solve(&segment("L D R L"), &COSTS, 1);
+        let one_branch = solve(&segment("L D R L"), &COSTS, &Settings { max_footing_branches: 1, ..SETTINGS });
         assert!(!one_branch.exact);
         assert_eq!(one_branch.steps.len(), 4);
         assert_eq!(one_branch.widest, 1);
-        assert!(one_branch.cost > solve(&segment("L D R L"), &COSTS, WIDTH).cost);
+        assert!(one_branch.cost > solve(&segment("L D R L"), &COSTS, &WIDE).cost);
     }
 
     struct SongChart {
@@ -1648,8 +1659,10 @@ pub(super) mod tests {
         charts
     }
 
-    fn max_width() -> usize {
-        std::env::var("DDR_TREE_WIDTH").map_or(5000, |width| width.parse().expect("a number"))
+    /// `SETTINGS`, but as wide as `DDR_TREE_WIDTH` if it's set.
+    fn harness_settings() -> Settings {
+        let width = std::env::var("DDR_TREE_WIDTH").map_or(SETTINGS.max_footing_branches, |width| width.parse().expect("a number"));
+        Settings { max_footing_branches: width, ..SETTINGS }
     }
 
     /// For the .sm files under `DDR_SONGS`, tab separated: a `SEG` line per segment (notes, whether
@@ -1660,14 +1673,14 @@ pub(super) mod tests {
     #[test]
     #[ignore]
     fn report_songs() {
-        use super::super::{SEGMENT_BREAK_SECONDS, segments};
+        use super::super::segments;
         const PATTERNS: [Technique; 4] = [Technique::Staircase, Technique::Drill, Technique::Gallop, Technique::Triple];
 
-        let max_width = max_width();
+        let settings = harness_settings();
         for chart in song_charts() {
             let (mut events, mut found, mut drill_notes, mut inexact) = (Events::default(), [0; 4], 0, 0);
-            for segment in segments(&chart.notes, SEGMENT_BREAK_SECONDS) {
-                let solution = solve(segment, &super::COSTS, max_width);
+            for segment in segments(&chart.notes, settings.segment_break_seconds) {
+                let solution = solve(segment, &super::COSTS, &settings);
                 println!(
                     "SEG\t{}\t{}\t{}\t{}\t{}\t{}",
                     segment.len(),
@@ -1715,14 +1728,14 @@ pub(super) mod tests {
     #[test]
     #[ignore]
     fn time_songs() {
-        use super::super::{SEGMENT_BREAK_SECONDS, segments};
+        use super::super::segments;
         use std::time::Instant;
 
         let runs: usize = std::env::var("DDR_RUNS").map_or(5, |runs| runs.parse().expect("a number"));
-        let max_width = max_width();
+        let settings = harness_settings();
         let charts = song_charts();
         let chart_segments: Vec<Vec<&[TimedNote]>> =
-            charts.iter().map(|chart| segments(&chart.notes, SEGMENT_BREAK_SECONDS)).collect();
+            charts.iter().map(|chart| segments(&chart.notes, settings.segment_break_seconds)).collect();
         // [chart][run]
         let mut seconds = vec![Vec::with_capacity(runs); charts.len()];
         let mut nodes = vec![0; charts.len()];
@@ -1731,7 +1744,7 @@ pub(super) mod tests {
                 let start = Instant::now();
                 let mut tried = 0;
                 for segment in segments {
-                    tried += std::hint::black_box(solve(segment, &super::COSTS, max_width)).nodes;
+                    tried += std::hint::black_box(solve(segment, &super::COSTS, &settings)).nodes;
                 }
                 seconds[chart].push(start.elapsed().as_secs_f64());
                 nodes[chart] = tried;

@@ -2,23 +2,21 @@
 //!
 //! A pattern's notes each have one arrow, stepped without a bracket or a freeze switch.
 
+use super::super::Settings;
 use super::super::technique::{Occurrence, Technique, even, even_runs};
 use super::{DOWN_ARROW, Events, Foot, LEFT_ARROW, RIGHT_ARROW, Step, TIME_EPSILON, TimedNote, UP_ARROW, steps_on};
-
-/// A gallop or triple is on its own if the gap on each side is this many times its own, at least.
-const ISOLATION: f64 = 2.0;
-const MIN_DRILL_NOTES: usize = 5;
 
 /// The patterns of `segment`, footed by `steps`, each on its first note:
 /// - staircase: each arrow once from one side to the other, feet alternating, evenly spaced
 ///   (LDUR, LUDR, RUDL or RDUL). Two may share an end note.
-/// - drill: `MIN_DRILL_NOTES` or more notes back and forth between two arrows, a foot on each,
-///   evenly spaced. The next may start on its last note.
-/// - gallop: 2 notes on their own, on different arrows and feet
+/// - drill: `Settings::min_drill_notes` or more notes back and forth between two arrows, a foot
+///   on each, evenly spaced. The next may start on its last note.
+/// - gallop: 2 notes on their own (see `Settings::isolation`), on different arrows and feet
 /// - triple: 3 evenly spaced notes on their own, feet alternating
 ///
-/// None has a speed limit: each one's speed is in its `Occurrence`.
-pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events]) -> Vec<Occurrence> {
+/// Evenly spaced is by `Settings::even_tolerance`. None has a speed limit: each one's speed is in
+/// its `Occurrence`.
+pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events], settings: &Settings) -> Vec<Occurrence> {
     let notes = segment.len();
     let mut found = Vec::new();
 
@@ -45,7 +43,8 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events]) -> Ve
             && gap(i) > TIME_EPSILON
     };
     let alone = |first: usize, last: usize, gap: f64| {
-        before(first) >= ISOLATION * gap - TIME_EPSILON && after(last) >= ISOLATION * gap - TIME_EPSILON
+        let least = settings.isolation * gap - TIME_EPSILON;
+        before(first) >= least && after(last) >= least
     };
     let mut add = |technique: Technique, first: usize, notes: usize| {
         found.push(Occurrence::over(technique, segment, first, notes));
@@ -58,7 +57,7 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events]) -> Ve
     }
     for i in 2..notes {
         let (shortest, longest) = (gap(i - 1).min(gap(i)), gap(i - 1).max(gap(i)));
-        if alternates(i - 1) && alternates(i) && even(shortest, longest) && alone(i - 2, i, longest) {
+        if alternates(i - 1) && alternates(i) && even(shortest, longest, settings.even_tolerance) && alone(i - 2, i, longest) {
             add(Technique::Triple, i - 2, 3);
         }
     }
@@ -73,12 +72,12 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events]) -> Ve
             (arrow(i - 2), arrow(i - 1)),
             (Some(DOWN_ARROW), Some(UP_ARROW)) | (Some(UP_ARROW), Some(DOWN_ARROW))
         );
-        if ends && middle && (i - 2..=i).all(alternates) && even(shortest, longest) {
+        if ends && middle && (i - 2..=i).all(alternates) && even(shortest, longest, settings.even_tolerance) {
             add(Technique::Staircase, i - 3, 4);
         }
     }
     let back_and_forth = |first: usize, i: usize| i - first < 2 || arrow(i) == arrow(i - 2);
-    for (first, notes) in even_runs(segment, MIN_DRILL_NOTES, alternates, back_and_forth) {
+    for (first, notes) in even_runs(segment, settings.min_drill_notes, settings.even_tolerance, alternates, back_and_forth) {
         add(Technique::Drill, first, notes);
     }
     found
@@ -86,11 +85,9 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events]) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::segment;
+    use super::super::tests::{WIDE, segment};
     use super::super::{Cost, Costs, TEST_COSTS as COSTS, solve};
     use super::*;
-
-    const WIDTH: usize = 1_000_000;
 
     /// A footing's patterns, counted.
     #[derive(Debug, Default, PartialEq)]
@@ -107,7 +104,7 @@ mod tests {
     }
 
     fn found_in(notes: &[TimedNote]) -> Patterns {
-        let solution = solve(notes, &COSTS, WIDTH);
+        let solution = solve(notes, &COSTS, &WIDE);
         Patterns {
             staircases: solution.count(Technique::Staircase),
             drills: solution.count(Technique::Drill),
@@ -123,7 +120,7 @@ mod tests {
 
     /// The notes (0-based) a pattern starts at.
     fn starts(tokens: &str, technique: Technique) -> Vec<usize> {
-        solve(&segment(tokens), &COSTS, WIDTH).of(technique).map(|pattern| pattern.note).collect()
+        solve(&segment(tokens), &COSTS, &WIDE).of(technique).map(|pattern| pattern.note).collect()
     }
 
     #[test]
@@ -159,7 +156,7 @@ mod tests {
         assert_eq!(starts("LR U D U D U", Technique::Drill), [1]);
         // One foot for both arrows isn't a drill
         let jacks = Costs { vertical_footswitch: Cost { base: 100.0, speed: 0.0 }, ..COSTS };
-        assert_eq!(solve(&segment("U U U U U"), &jacks, WIDTH).count(Technique::Drill), 0);
+        assert_eq!(solve(&segment("U U U U U"), &jacks, &WIDE).count(Technique::Drill), 0);
     }
 
     #[test]
@@ -203,7 +200,7 @@ mod tests {
     fn times_each_pattern() {
         // (first note, notes, notes per second) of each pattern of a kind
         let timed = |tokens: &str, technique: Technique| -> Vec<(usize, usize, f64)> {
-            let solution = solve(&segment(tokens), &COSTS, WIDTH);
+            let solution = solve(&segment(tokens), &COSTS, &WIDE);
             solution.of(technique).map(|pattern| (pattern.note, pattern.notes, pattern.speed)).collect()
         };
         // Notes 0.125 s apart: 8 a second. A row between: 4.

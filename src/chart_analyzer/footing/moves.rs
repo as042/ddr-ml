@@ -46,13 +46,13 @@ fn position(arrows: Arrows) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::segment;
+    use super::super::tests::{WIDE, segment};
     use super::super::{TEST_COSTS, solve};
     use super::*;
 
     /// (note, seconds, distance) of each move in the cheapest footing.
     fn moves(tokens: &str) -> Vec<(usize, f64, f64)> {
-        solve(&segment(tokens), &TEST_COSTS, 1_000_000).moves.iter().map(|m| (m.note, m.seconds, m.distance)).collect()
+        solve(&segment(tokens), &TEST_COSTS, &WIDE).moves.iter().map(|m| (m.note, m.seconds, m.distance)).collect()
     }
 
     #[test]

@@ -14,14 +14,87 @@ pub use footing::{COSTS, Costs, Events, Foot, Solution};
 pub use statistics::ChartStatistics;
 pub use technique::{Source, Technique};
 
-impl StepChart {
-    /// `bpms` and `stops` are shared by all of a .sm file's charts.
-    #[allow(dead_code)] // Not called yet
-    pub fn analyze(&self, bpms: &[BPMChange], stops: &[Stop]) -> ChartStatistics {
-        match self {
-            StepChart::DanceSingle(single_chart) => analyze_single_chart(single_chart, bpms, stops, &COSTS),
-            StepChart::DanceDouble(_double_chart) => analyze_double_chart(),
+/// The analyzer's thresholds, beside the foot simulation's costs. `SETTINGS` are the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Settings {
+    /// Longest gap between notes of one segment, unless a hold runs through it (see `segments`)
+    pub segment_break_seconds: f64,
+    /// Most branches the foot search keeps after a note (see `footing`)
+    pub max_footing_branches: usize,
+    /// Degrees a turn can go back from its furthest point and still be one turn (see `footing`)
+    pub turn_back_degrees: i32,
+    /// Sliding window for the notes and the cost per second
+    pub window_seconds: f64,
+    /// Longer gaps between notes are breaks, not active time
+    pub active_gap_seconds: f64,
+    /// Gaps are even if the longest is this fraction longer than the shortest, at most
+    pub even_tolerance: f64,
+    /// Fewest notes in a stream
+    pub min_stream_notes: usize,
+    /// Fewest notes in a drill
+    pub min_drill_notes: usize,
+    /// A gallop or triple is on its own if the gap on each side is this many times its own, at
+    /// least
+    pub isolation: f64,
+}
+
+pub const SETTINGS: Settings = Settings {
+    segment_break_seconds: 2.0,
+    max_footing_branches: 5000,
+    turn_back_degrees: 45,
+    window_seconds: 1.0,
+    active_gap_seconds: 1.0,
+    even_tolerance: 0.1,
+    min_stream_notes: 8,
+    min_drill_notes: 5,
+    isolation: 2.0,
+};
+
+impl Settings {
+    /// Every setting by name (its field's, with spaces), as a number.
+    pub fn values(&self) -> [(&'static str, f64); 9] {
+        [
+            ("segment break seconds", self.segment_break_seconds),
+            ("max footing branches", self.max_footing_branches as f64),
+            ("turn back degrees", self.turn_back_degrees as f64),
+            ("window seconds", self.window_seconds),
+            ("active gap seconds", self.active_gap_seconds),
+            ("even tolerance", self.even_tolerance),
+            ("min stream notes", self.min_stream_notes as f64),
+            ("min drill notes", self.min_drill_notes as f64),
+            ("isolation", self.isolation),
+        ]
+    }
+
+    /// Sets the one called `name` (as in `values`), or says why `value` can't be it.
+    pub fn set(&mut self, name: &str, value: f64) -> Result<(), String> {
+        let at_least = |least: f64| match value.is_finite() && value >= least {
+            true => Ok(value),
+            false => Err(format!("must be {least} or more")),
+        };
+        let positive = || match value.is_finite() && value > 0.0 {
+            true => Ok(value),
+            false => Err("must be more than 0".to_string()),
+        };
+        // Below a billion, which fits any integer type here
+        let whole = |least: f64| match value.fract() == 0.0 && (least..1e9).contains(&value) {
+            true => Ok(value),
+            false => Err(format!("must be a whole number, {least} or more")),
+        };
+        match name {
+            "segment break seconds" => self.segment_break_seconds = at_least(0.0)?,
+            "max footing branches" => self.max_footing_branches = whole(1.0)? as usize,
+            "turn back degrees" => self.turn_back_degrees = whole(0.0)? as i32,
+            "window seconds" => self.window_seconds = positive()?,
+            "active gap seconds" => self.active_gap_seconds = at_least(0.0)?,
+            "even tolerance" => self.even_tolerance = at_least(0.0)?,
+            // A run of one note has no gap
+            "min stream notes" => self.min_stream_notes = whole(2.0)? as usize,
+            "min drill notes" => self.min_drill_notes = whole(2.0)? as usize,
+            "isolation" => self.isolation = at_least(0.0)?,
+            _ => return Err(format!("there is no setting called {name}")),
         }
+        Ok(())
     }
 }
 
@@ -40,7 +113,7 @@ pub fn analyze_singles(sim: &SimFile) -> Vec<AnalyzedChart> {
             StepChart::DanceSingle(single) => Some(AnalyzedChart {
                 difficulty: single.difficulty,
                 rating: single.rating,
-                stats: analyze_single_chart(single, &sim.bpms, &sim.stops, &COSTS),
+                stats: analyze_single_chart(single, &sim.bpms, &sim.stops, &COSTS, &SETTINGS),
             }),
             StepChart::DanceDouble(_) => None,
         })
@@ -48,29 +121,32 @@ pub fn analyze_singles(sim: &SimFile) -> Vec<AnalyzedChart> {
 }
 
 /// `costs`: the foot simulation's.
-fn analyze_single_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs) -> ChartStatistics {
+pub fn analyze_single_chart(
+    chart: &SingleChart,
+    bpms: &[BPMChange],
+    stops: &[Stop],
+    costs: &Costs,
+    settings: &Settings,
+) -> ChartStatistics {
     let timing = Timing::new(bpms, stops);
     let notes = to_timed_notes(&chart.measures, &timing);
     let mut stats = ChartStatistics::default();
-    counts::count(&chart.measures, &notes, &timing, &mut stats);
+    counts::count(&chart.measures, &notes, &timing, settings, &mut stats);
     radar::count(&chart.measures, &timing, &mut stats);
 
     let (mut occurrences, mut note_costs, mut moves) = (Vec::new(), Vec::new(), Vec::new());
-    for segment in segments(&notes, SEGMENT_BREAK_SECONDS) {
-        occurrences.extend(sequences::find(segment));
-        let footing = foot_segment(segment, costs);
+    for segment in segments(&notes, settings.segment_break_seconds) {
+        occurrences.extend(sequences::find(segment, settings));
+        let footing = footing::solve(segment, costs, settings);
         occurrences.extend(footing.occurrences);
         note_costs.extend(footing.note_costs);
         moves.extend(footing.moves);
     }
     stats.techniques = statistics::summarize(&occurrences);
-    counts::count_costs(&notes, note_costs, &mut stats);
+    counts::count_costs(&notes, note_costs, settings.window_seconds, &mut stats);
     counts::count_feet(&moves, &mut stats);
     stats
 }
-
-/// Longest gap between notes of one segment, unless a hold runs through it (see `segments`).
-const SEGMENT_BREAK_SECONDS: f64 = 2.0;
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
 /// 1000 BPM are 1.25 ms apart).
@@ -196,24 +272,21 @@ fn segments(notes: &[TimedNote], break_seconds: f64) -> Vec<&[TimedNote]> {
     segments
 }
 
-/// Most branches the foot search keeps after a note (see `footing`).
-const MAX_FOOTING_BRANCHES: usize = 5000;
-
 /// A segment and its cheapest footing.
 pub struct FootedSegment {
     pub notes: Vec<TimedNote>,
     pub footing: Solution,
 }
 
-/// A chart's notes in segments, split as for the footing statistics.
+/// A chart's notes in segments, split as for the footing statistics with `SETTINGS`.
 pub fn footing_segments(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop]) -> Vec<Vec<TimedNote>> {
     let notes = to_timed_notes(&chart.measures, &Timing::new(bpms, stops));
-    segments(&notes, SEGMENT_BREAK_SECONDS).into_iter().map(<[TimedNote]>::to_vec).collect()
+    segments(&notes, SETTINGS.segment_break_seconds).into_iter().map(<[TimedNote]>::to_vec).collect()
 }
 
-/// The cheapest footing of a segment, from home.
+/// The cheapest footing of a segment, from home, with `SETTINGS`.
 pub fn foot_segment(notes: &[TimedNote], costs: &Costs) -> Solution {
-    footing::solve(notes, costs, MAX_FOOTING_BRANCHES)
+    footing::solve(notes, costs, &SETTINGS)
 }
 
 /// Each of a chart's `footing_segments`, footed.
@@ -310,7 +383,7 @@ pub fn foot_arrows(arrows: &str, costs: &Costs, speed: f64) -> Result<FootedSegm
     if notes.is_empty() {
         return Err("no arrows".into());
     }
-    let footing = footing::solve(&notes, costs, MAX_FOOTING_BRANCHES);
+    let footing = footing::solve(&notes, costs, &SETTINGS);
     Ok(FootedSegment { notes, footing })
 }
 
@@ -364,11 +437,99 @@ mod tests {
 
     pub(super) fn stats(file: &str, difficulty: ChartDifficulty) -> ChartStatistics {
         let sim = load(file);
-        analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops, &COSTS)
+        analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops, &COSTS, &SETTINGS)
     }
 
     pub(super) fn assert_close(actual: f64, expected: f64, what: &str) {
         assert!((actual - expected).abs() < 1e-9, "{what}: expected {expected}, got {actual}");
+    }
+
+    /// A Hard chart of rows 0.125 s apart (16ths at 120 BPM): `L`, `D`, `U` and `R` for taps, `.`
+    /// for an empty row.
+    fn sixteenths(tokens: &str) -> SingleChart {
+        let mut rows: Vec<[Note; 4]> = tokens
+            .split_whitespace()
+            .map(|token| {
+                let mut row = [Note::Empty; 4];
+                for (arrow, letter) in "LDUR".chars().enumerate() {
+                    if token.contains(letter) {
+                        row[arrow] = Note::Tap;
+                    }
+                }
+                row
+            })
+            .collect();
+        rows.resize(rows.len().next_multiple_of(16), [Note::Empty; 4]);
+        let measures = rows.chunks(16).map(|rows| Measure { num_beats: 4, rows: rows.to_vec() }).collect();
+        SingleChart { difficulty: Hard, rating: 10.0, measures }
+    }
+
+    #[test]
+    fn every_setting_reaches_the_statistics() {
+        // Segments: a footing a search one branch wide gets wrong; one that spins when a turn can't
+        // go back at all; a stream and a drill straight into a slower stream, then a gallop
+        let gap = ". ".repeat(24);
+        let chart = sixteenths(&format!(
+            "L D R L {gap} U L D R U L D R U L D R {gap} L R L R L R L R L R L R . L . D . U . R . L . D . U . R . . . . U D"
+        ));
+        let bpms = [BPMChange { beat: 0.0, bpm: 120.0 }];
+        // Crossovers cheap enough to hide a spin behind
+        let costs = Costs { horizontal_crossover: Cost { base: 1.5, speed: 0.2 }, ..COSTS };
+        let statistic = |settings: &Settings, name: &str| {
+            let features = analyze_single_chart(&chart, &bpms, &[], &costs, settings).features();
+            features.into_iter().find(|(feature, _)| feature == name).unwrap_or_else(|| panic!("no {name}")).1
+        };
+        let changes = [
+            ("segment break seconds", 0.0, "stream_count"),
+            ("max footing branches", 1.0, "mean_cost_per_note"),
+            ("turn back degrees", 0.0, "half_spin_count"),
+            ("window seconds", 10.0, "max_notes_per_second"),
+            ("active gap seconds", 0.0, "longest_run_notes"),
+            ("even tolerance", 1.0, "stream_count"),
+            ("min stream notes", 1000.0, "stream_count"),
+            ("min drill notes", 1000.0, "drill_count"),
+            ("isolation", 1000.0, "gallop_count"),
+        ];
+        let names: Vec<&str> = SETTINGS.values().iter().map(|(name, _)| *name).collect();
+        assert_eq!(changes.map(|(name, ..)| name).to_vec(), names, "one change per setting");
+        for (name, value, changed) in changes {
+            let mut settings = SETTINGS;
+            settings.set(name, value).unwrap();
+            assert_ne!(statistic(&settings, changed), statistic(&SETTINGS, changed), "{name} at {value}: {changed}");
+        }
+    }
+
+    #[test]
+    fn sets_each_setting_by_name() {
+        // `values` names the fields
+        let fields = serde_json::to_value(SETTINGS).unwrap();
+        let fields = fields.as_object().unwrap();
+        assert_eq!(fields.len(), SETTINGS.values().len());
+        for (name, value) in SETTINGS.values() {
+            assert_eq!(fields[&name.replace(' ', "_")].as_f64(), Some(value), "{name}");
+        }
+
+        let mut settings = SETTINGS;
+        for (name, value) in [("turn back degrees", 90.0), ("max footing branches", 7.0), ("even tolerance", 0.0)] {
+            settings.set(name, value).unwrap();
+        }
+        assert_eq!((settings.turn_back_degrees, settings.max_footing_branches, settings.even_tolerance), (90, 7, 0.0));
+        let refused = [
+            ("max footing branches", 0.0, "a whole number, 1 or more"),
+            ("max footing branches", 2.5, "a whole number, 1 or more"),
+            ("min stream notes", 1.0, "a whole number, 2 or more"),
+            ("turn back degrees", -45.0, "a whole number, 0 or more"),
+            ("window seconds", 0.0, "more than 0"),
+            ("segment break seconds", -1.0, "0 or more"),
+            ("isolation", f64::NAN, "0 or more"),
+            ("active gap seconds", f64::INFINITY, "0 or more"),
+            ("segment length", 1.0, "no setting called segment length"),
+        ];
+        for (name, value, error) in refused {
+            let mut settings = SETTINGS;
+            let message = settings.set(name, value).unwrap_err();
+            assert!(message.contains(error), "{name} {value}: {message}");
+        }
     }
 
     #[test]
@@ -472,7 +633,7 @@ mod tests {
             TimedNote { time, beat: time, row, hold_ends }
         };
         let lengths = |notes: &[TimedNote]| -> Vec<usize> {
-            segments(notes, SEGMENT_BREAK_SECONDS).iter().map(|segment| segment.len()).collect()
+            segments(notes, SETTINGS.segment_break_seconds).iter().map(|segment| segment.len()).collect()
         };
         // Taps: a gap of 2.5 s is a break, one of 2 s isn't
         assert_eq!(lengths(&[at(0.0, 0, None), at(1.0, 1, None), at(3.5, 2, None), at(4.0, 3, None)]), [2, 2]);
@@ -494,7 +655,7 @@ mod tests {
         let footing = foot_segment(&held, &COSTS);
         assert!(footing.cost > 0.0);
         assert_eq!(foot_segment(&held[1..], &COSTS).cost, 0.0);
-        let found = sequences::find(&held);
+        let found = sequences::find(&held, &SETTINGS);
         assert_eq!(found.iter().filter(|found| found.technique == Technique::HeldStep).count(), 3);
     }
 
@@ -506,7 +667,7 @@ mod tests {
             [(Beginner, &[]), (Easy, &[5, 1]), (Medium, &[3, 3]), (Hard, &[4, 4]), (Challenge, &[6, 4, 6])];
         for (difficulty, lengths) in expected {
             let notes = to_timed_notes(&single(&sim, difficulty).measures, &timing);
-            let segments = segments(&notes, SEGMENT_BREAK_SECONDS);
+            let segments = segments(&notes, SETTINGS.segment_break_seconds);
             let actual: Vec<usize> = segments.iter().map(|segment| segment.len()).collect();
             assert_eq!(actual, lengths, "{difficulty:?}: notes in each segment");
         }

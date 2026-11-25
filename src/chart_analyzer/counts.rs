@@ -7,24 +7,18 @@ use std::ops::Range;
 use super::footing::moves::Move;
 use super::statistics::{BURST_NOTES, ChartStatistics, NOTE_SUB_DIVS, SUSTAINED_SECONDS, Spread};
 use super::technique::speed;
-use super::{TIME_EPSILON, TimedNote, Timing, arrows, row_beat};
+use super::{Settings, TIME_EPSILON, TimedNote, Timing, arrows, row_beat};
 use crate::sim_loader::{Measure, Note};
 
-/// Sliding window length for the notes and the cost per second (see `windows`).
-const WINDOW_SECONDS: f64 = 1.0;
-
-/// Longer gaps between notes are breaks, not active time.
-const ACTIVE_GAP_SECONDS: f64 = 1.0;
-
 /// Every statistic but the techniques' and the footing's costs. `notes`: the measures', timed.
-pub(super) fn count(measures: &[Measure], notes: &[TimedNote], timing: &Timing, stats: &mut ChartStatistics) {
+pub(super) fn count(measures: &[Measure], notes: &[TimedNote], timing: &Timing, settings: &Settings, stats: &mut ChartStatistics) {
     let span = count_notes_and_rhythms(measures, stats);
     count_bpms(timing, span, stats);
-    count_duration(notes, timing, span, stats);
+    count_duration(notes, timing, span, settings.active_gap_seconds, stats);
     count_stops(timing, span, stats);
     count_arrows(notes, stats);
     count_holds(notes, stats);
-    count_notes_per_second(notes, stats);
+    count_notes_per_second(notes, settings, stats);
     count_gaps(notes, stats);
 }
 
@@ -42,11 +36,14 @@ fn windows(notes: &[TimedNote], seconds: f64) -> impl Iterator<Item = Range<usiz
     })
 }
 
-fn count_notes_per_second(notes: &[TimedNote], stats: &mut ChartStatistics) {
-    let per_second: Vec<f64> = windows(notes, WINDOW_SECONDS).map(|window| window.len() as f64 / WINDOW_SECONDS).collect();
+/// Notes per second in each `Settings::window_seconds`, and the longest run with no gap over
+/// `Settings::active_gap_seconds`.
+fn count_notes_per_second(notes: &[TimedNote], settings: &Settings, stats: &mut ChartStatistics) {
+    let window_seconds = settings.window_seconds;
+    let per_second: Vec<f64> = windows(notes, window_seconds).map(|window| window.len() as f64 / window_seconds).collect();
     // Windows with all their second inside the chart
     let last = notes.last().map_or(0.0, |note| note.time);
-    let whole = notes.iter().take_while(|note| note.time + WINDOW_SECONDS <= last + TIME_EPSILON).count();
+    let whole = notes.iter().take_while(|note| note.time + window_seconds <= last + TIME_EPSILON).count();
     stats.min_notes_per_second = Spread::of(per_second[..whole].to_vec()).min;
 
     let spread = Spread::of(per_second);
@@ -60,16 +57,17 @@ fn count_notes_per_second(notes: &[TimedNote], stats: &mut ChartStatistics) {
         let seconds = *seconds as f64;
         *sustained = windows(notes, seconds).map(|window| window.len()).max().unwrap_or(0) as f64 / seconds;
     }
-    for run in notes.chunk_by(|a, b| b.time - a.time <= ACTIVE_GAP_SECONDS + TIME_EPSILON) {
+    for run in notes.chunk_by(|a, b| b.time - a.time <= settings.active_gap_seconds + TIME_EPSILON) {
         stats.longest_run_notes = stats.longest_run_notes.max(run.len());
         stats.longest_run_seconds = stats.longest_run_seconds.max(run[run.len() - 1].time - run[0].time);
     }
 }
 
-/// `note_costs`: one per note (see `footing::Solution::note_costs`).
-pub(super) fn count_costs(notes: &[TimedNote], note_costs: Vec<f64>, stats: &mut ChartStatistics) {
-    let windows = windows(notes, WINDOW_SECONDS);
-    let per_second = Spread::of(windows.map(|window| note_costs[window].iter().sum::<f64>() / WINDOW_SECONDS).collect());
+/// `note_costs`: one per note (see `footing::Solution::note_costs`). Per second is in each
+/// `window_seconds`.
+pub(super) fn count_costs(notes: &[TimedNote], note_costs: Vec<f64>, window_seconds: f64, stats: &mut ChartStatistics) {
+    let windows = windows(notes, window_seconds);
+    let per_second = Spread::of(windows.map(|window| note_costs[window].iter().sum::<f64>() / window_seconds).collect());
     (stats.mean_cost_per_second, stats.median_cost_per_second, stats.max_cost_per_second) =
         (per_second.mean, per_second.median, per_second.max);
     let per_note = Spread::of(note_costs);
@@ -133,7 +131,8 @@ fn count_holds(notes: &[TimedNote], stats: &mut ChartStatistics) {
 }
 
 /// `span`: beats of the first and last objects, from `count_notes_and_rhythms`.
-fn count_duration(notes: &[TimedNote], timing: &Timing, span: Option<(f64, f64)>, stats: &mut ChartStatistics) {
+/// `active_gap_seconds`: longer gaps between notes are breaks, not active time.
+fn count_duration(notes: &[TimedNote], timing: &Timing, span: Option<(f64, f64)>, active_gap_seconds: f64, stats: &mut ChartStatistics) {
     let Some((first, last)) = span else { return };
     let (start, end) = (timing.time_at(first), timing.time_at(last));
     stats.chart_start = start;
@@ -145,7 +144,7 @@ fn count_duration(notes: &[TimedNote], timing: &Timing, span: Option<(f64, f64)>
     // Active intervals: note pairs with no break between them, and holds
     let mut active: Vec<(f64, f64)> = notes
         .windows(2)
-        .filter(|pair| pair[1].time - pair[0].time <= ACTIVE_GAP_SECONDS + TIME_EPSILON)
+        .filter(|pair| pair[1].time - pair[0].time <= active_gap_seconds + TIME_EPSILON)
         .map(|pair| (pair[0].time, pair[1].time))
         .collect();
     for note in notes {
