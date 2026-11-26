@@ -36,6 +36,9 @@ pub struct Settings {
     /// A gallop or triple is on its own if the gap on each side is this many times its own, at
     /// least
     pub isolation: f64,
+    /// A gallop this close or closer is a flam, hit with one motion like a jump: one note in the
+    /// density and gap statistics, timed by the gap before it. 0 for none
+    pub flam_seconds: f64,
 }
 
 pub const SETTINGS: Settings = Settings {
@@ -48,11 +51,13 @@ pub const SETTINGS: Settings = Settings {
     min_stream_notes: 8,
     min_drill_notes: 5,
     isolation: 2.0,
+    // 24ths at 200 BPM
+    flam_seconds: 0.05,
 };
 
 impl Settings {
     /// Every setting by name (its field's, with spaces), as a number.
-    pub fn values(&self) -> [(&'static str, f64); 9] {
+    pub fn values(&self) -> [(&'static str, f64); 10] {
         [
             ("segment break seconds", self.segment_break_seconds),
             ("max footing branches", self.max_footing_branches as f64),
@@ -63,6 +68,7 @@ impl Settings {
             ("min stream notes", self.min_stream_notes as f64),
             ("min drill notes", self.min_drill_notes as f64),
             ("isolation", self.isolation),
+            ("flam seconds", self.flam_seconds),
         ]
     }
 
@@ -92,6 +98,7 @@ impl Settings {
             "min stream notes" => self.min_stream_notes = whole(2.0)? as usize,
             "min drill notes" => self.min_drill_notes = whole(2.0)? as usize,
             "isolation" => self.isolation = at_least(0.0)?,
+            "flam seconds" => self.flam_seconds = at_least(0.0)?,
             _ => return Err(format!("there is no setting called {name}")),
         }
         Ok(())
@@ -151,10 +158,6 @@ pub struct AnalyzedSegment {
 pub fn analyze_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], costs: &Costs, settings: &Settings) -> ChartAnalysis {
     let timing = Timing::new(bpms, stops);
     let notes = to_timed_notes(&chart.measures, &timing);
-    let mut stats = ChartStatistics::default();
-    counts::count(&chart.measures, &notes, &timing, settings, &mut stats);
-    radar::count(&chart.measures, &timing, &mut stats);
-
     let segments: Vec<AnalyzedSegment> = segments(&notes, settings.segment_break_seconds)
         .into_iter()
         .map(|segment| AnalyzedSegment {
@@ -163,6 +166,10 @@ pub fn analyze_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], co
             from_notes: sequences::find(segment, settings),
         })
         .collect();
+    let mut stats = ChartStatistics::default();
+    counts::count(&chart.measures, &notes, &motions(&segments, settings), &timing, settings, &mut stats);
+    radar::count(&chart.measures, &timing, &mut stats);
+
     let occurrences: Vec<technique::Occurrence> =
         segments.iter().flat_map(|segment| segment.from_notes.iter().chain(&segment.footing.occurrences)).copied().collect();
     stats.techniques = statistics::summarize(&occurrences);
@@ -171,6 +178,21 @@ pub fn analyze_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], co
     let moves: Vec<footing::moves::Move> = segments.iter().flat_map(|segment| segment.footing.moves.iter().copied()).collect();
     counts::count_feet(&moves, &mut stats);
     ChartAnalysis { stats, segments }
+}
+
+/// The chart's notes with each flam (`Settings::flam_seconds`) as one: its first.
+fn motions(segments: &[AnalyzedSegment], settings: &Settings) -> Vec<TimedNote> {
+    let mut motions = Vec::new();
+    for segment in segments {
+        let flams: Vec<usize> = (segment.footing.occurrences.iter())
+            .filter(|found| found.technique == technique::Technique::Gallop)
+            .filter(|found| footing::patterns::flam(&segment.notes, found.note, settings))
+            .map(|found| found.note + 1)
+            .collect();
+        let kept = segment.notes.iter().enumerate().filter(|(i, _)| !flams.contains(i));
+        motions.extend(kept.map(|(_, note)| *note));
+    }
+    motions
 }
 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
@@ -515,6 +537,7 @@ mod tests {
             ("min stream notes", 1000.0, "stream_count"),
             ("min drill notes", 1000.0, "drill_count"),
             ("isolation", 1000.0, "gallop_count"),
+            ("flam seconds", 0.2, "gallop_mean_speed"),
         ];
         let names: Vec<&str> = SETTINGS.values().iter().map(|(name, _)| *name).collect();
         assert_eq!(changes.map(|(name, ..)| name).to_vec(), names, "one change per setting");
@@ -523,6 +546,26 @@ mod tests {
             settings.set(name, value).unwrap();
             assert_ne!(statistic(&settings, changed), statistic(&SETTINGS, changed), "{name} at {value}: {changed}");
         }
+    }
+
+    #[test]
+    fn counts_a_flam_as_one_note_in_density_and_gaps() {
+        // A gallop on its own: notes 1 s, 0.125 s and 1 s apart
+        let chart = sixteenths("L . . . . . . . U D . . . . . . . R");
+        let flams = Settings { flam_seconds: 0.125, ..SETTINGS };
+        let feature = |settings: &Settings, name: &str| {
+            let features = analyze_single_chart(&chart, &chart.bpms, &chart.stops, &COSTS, settings).features();
+            features.into_iter().find(|(feature, _)| feature == name).unwrap_or_else(|| panic!("no {name}")).1
+        };
+        for settings in [&SETTINGS, &flams] {
+            assert_eq!((feature(settings, "gallop_count"), feature(settings, "num_notes")), (1.0, 4.0));
+        }
+        // A gallop: at its own gap. A flam: one note, at the gap before it
+        assert_eq!((feature(&SETTINGS, "gallop_max_speed"), feature(&flams, "gallop_max_speed")), (8.0, 1.0));
+        assert_eq!((feature(&SETTINGS, "burst_2_speed"), feature(&flams, "burst_2_speed")), (8.0, 1.0));
+        assert_close(feature(&SETTINGS, "mean_note_gap"), 2.125 / 3.0, "mean gap");
+        assert_close(feature(&flams, "mean_note_gap"), 2.125 / 2.0, "mean gap, flam as one");
+        assert_eq!((feature(&SETTINGS, "max_notes_per_second"), feature(&flams, "max_notes_per_second")), (2.0, 1.0));
     }
 
     #[test]
@@ -549,6 +592,7 @@ mod tests {
             ("segment break seconds", -1.0, "0 or more"),
             ("isolation", f64::NAN, "0 or more"),
             ("active gap seconds", f64::INFINITY, "0 or more"),
+            ("flam seconds", -0.01, "0 or more"),
             ("segment length", 1.0, "no setting called segment length"),
         ];
         for (name, value, error) in refused {

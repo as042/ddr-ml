@@ -11,15 +11,24 @@ use super::{Settings, TIME_EPSILON, TimedNote, Timing, arrows, row_beat};
 use crate::sim_loader::{Measure, Note};
 
 /// Every statistic but the techniques' and the footing's costs. `notes`: the measures', timed.
-pub(super) fn count(measures: &[Measure], notes: &[TimedNote], timing: &Timing, settings: &Settings, stats: &mut ChartStatistics) {
+/// `motions`: the same, with each flam as one note (see `Settings::flam_seconds`), for the
+/// density and gap statistics.
+pub(super) fn count(
+    measures: &[Measure],
+    notes: &[TimedNote],
+    motions: &[TimedNote],
+    timing: &Timing,
+    settings: &Settings,
+    stats: &mut ChartStatistics,
+) {
     let span = count_notes_and_rhythms(measures, stats);
     count_bpms(timing, span, stats);
     count_duration(notes, timing, span, settings.active_gap_seconds, stats);
     count_stops(timing, span, stats);
     count_arrows(notes, stats);
     count_holds(notes, stats);
-    count_notes_per_second(notes, settings, stats);
-    count_gaps(notes, stats);
+    count_notes_per_second(motions, settings, stats);
+    count_gaps(motions, stats);
 }
 
 /// For each note, the notes from it up to (but not including) `seconds` later, by index.

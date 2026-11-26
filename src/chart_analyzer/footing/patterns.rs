@@ -3,7 +3,7 @@
 //! A pattern's notes each have one arrow, stepped without a bracket or a freeze switch.
 
 use super::super::Settings;
-use super::super::technique::{Occurrence, Technique, even, even_runs};
+use super::super::technique::{Occurrence, Technique, even, even_runs, speed};
 use super::{DOWN_ARROW, Events, Foot, LEFT_ARROW, RIGHT_ARROW, Step, TIME_EPSILON, TimedNote, UP_ARROW, steps_on};
 
 /// The patterns of `segment`, footed by `steps`, each on its first note:
@@ -11,7 +11,8 @@ use super::{DOWN_ARROW, Events, Foot, LEFT_ARROW, RIGHT_ARROW, Step, TIME_EPSILO
 ///   (LDUR, LUDR, RUDL or RDUL). Two may share an end note.
 /// - drill: `Settings::min_drill_notes` or more notes back and forth between two arrows, a foot
 ///   on each, evenly spaced. The next may start on its last note.
-/// - gallop: 2 notes on their own (see `Settings::isolation`), on different arrows and feet
+/// - gallop: 2 notes on their own (see `Settings::isolation`), on different arrows and feet. A
+///   flam (`flam`) is timed by the gap before it.
 /// - triple: 3 evenly spaced notes on their own, feet alternating
 ///
 /// Evenly spaced is by `Settings::even_tolerance`. None has a speed limit: each one's speed is in
@@ -46,15 +47,18 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events], setti
         let least = settings.isolation * gap - TIME_EPSILON;
         before(first) >= least && after(last) >= least
     };
+    for i in 1..notes {
+        if alternates(i) && alone(i - 1, i, gap(i)) {
+            let mut gallop = Occurrence::over(Technique::Gallop, segment, i - 1, 2);
+            if flam(segment, i - 1, settings) {
+                gallop.speed = speed(before(i - 1));
+            }
+            found.push(gallop);
+        }
+    }
     let mut add = |technique: Technique, first: usize, notes: usize| {
         found.push(Occurrence::over(technique, segment, first, notes));
     };
-
-    for i in 1..notes {
-        if alternates(i) && alone(i - 1, i, gap(i)) {
-            add(Technique::Gallop, i - 1, 2);
-        }
-    }
     for i in 2..notes {
         let (shortest, longest) = (gap(i - 1).min(gap(i)), gap(i - 1).max(gap(i)));
         if alternates(i - 1) && alternates(i) && even(shortest, longest, settings.even_tolerance) && alone(i - 2, i, longest) {
@@ -81,6 +85,11 @@ pub fn find(segment: &[TimedNote], steps: &[Step], step_events: &[Events], setti
         add(Technique::Drill, first, notes);
     }
     found
+}
+
+/// The gallop from note `first` is a flam: close enough to hit as one motion.
+pub fn flam(segment: &[TimedNote], first: usize, settings: &Settings) -> bool {
+    segment[first + 1].time - segment[first].time <= settings.flam_seconds + TIME_EPSILON
 }
 
 #[cfg(test)]
@@ -208,6 +217,14 @@ mod tests {
         assert_eq!(timed("L . D", Technique::Gallop), [(0, 2, 4.0)]);
         // The second is 0.5 s after the first, twice its own gap
         assert_eq!(timed("L D . . . L . D", Technique::Gallop), [(0, 2, 8.0), (2, 2, 4.0)]);
+        // As flams: the gap before, 0 for none
+        let flams = Settings { flam_seconds: 0.25, ..WIDE };
+        let timed_flams = |tokens: &str| -> Vec<(usize, usize, f64)> {
+            let solution = solve(&segment(tokens), &COSTS, &flams);
+            solution.of(Technique::Gallop).map(|pattern| (pattern.note, pattern.notes, pattern.speed)).collect()
+        };
+        assert_eq!(timed_flams("L D . . . L . D"), [(0, 2, 0.0), (2, 2, 2.0)]);
+        assert_eq!(timed_flams("U . . . L R"), [(1, 2, 2.0)]);
         assert_eq!(timed("L . D . U", Technique::Triple), [(0, 3, 4.0)]);
         assert_eq!(timed("L D U R", Technique::Staircase), [(0, 4, 8.0)]);
         assert_eq!(timed("L . . . D . . . U . . . R", Technique::Staircase), [(0, 4, 2.0)]);
