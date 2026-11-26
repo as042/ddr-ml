@@ -15,8 +15,8 @@ use burn::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::chart_analyzer::{
-    AnalyzedSegment, COSTS, ChartStatistics, Costs, Foot, FootedSegment, SETTINGS, Settings, Source, Technique,
-    analyze_chart, analyze_singles, foot_arrows, foot_chart, footing_segments,
+    AnalyzedSegment, COSTS, ChartStatistics, Costs, Foot, FootedSegment, MAX_COST, SETTINGS, Settings, Source,
+    Technique, analyze_chart, analyze_singles, foot_arrows, foot_chart, footing_segments,
 };
 #[cfg(test)]
 use crate::chart_analyzer::{Cost, analyze_single_chart};
@@ -37,6 +37,8 @@ const ARTIFACTS: &str = "artifacts";
 const DEFAULT_MODEL: &str = "a3_model3";
 /// In a model's folder (see `ModelInputs`).
 const INPUTS_FILE: &str = "inputs.json";
+/// In a model's folder (see `SplitRecord`).
+const SPLIT_FILE: &str = "split.json";
 const PCA_FILE: &str = "artifacts/pca.json";
 /// Untracked (copyrighted), see data/.gitignore.
 const PACKS_DIR: &str = "data/packs";
@@ -44,8 +46,9 @@ const PACKS_DIR: &str = "data/packs";
 const DATASET: [&str; 5] = ["DDR A (AC INTL)", "DDR A20 (AC INTL)", "DDR A20 PLUS (AC INTL)", "DDR A3 (AC INTL)", "DDR WORLD (AC INTL)"];
 /// The pack the chart spreadsheet counts.
 const SHEET_PACK: &str = "DDR A3 (AC INTL)";
-/// Picked on DDR A3 alone, where it put all 4 [ ]DENTITY charts in the test split.
-const SPLIT_SEED: u64 = 643;
+/// The first seed that puts all 5 [ ]DENTITY charts in the test split, on `DATASET`. (643 did
+/// it for the 4 on DDR A3 alone.)
+const SPLIT_SEED: u64 = 37565;
 /// Test-set predictions to print at the end.
 const EXAMPLES: usize = 12;
 /// An official rating N spans N.0 up to N + 1 on the model's scale. A chart trains as its middle.
@@ -54,6 +57,8 @@ const SCALE_NOTE: &str = "predicted: 14.00 is the easiest 14, 14.50 a typical 14
 
 struct Sample {
     name: String,
+    /// The file the chart is in
+    simfile: PathBuf,
     features: Vec<f32>,
     rating: f32,
 }
@@ -117,9 +122,53 @@ impl ModelInputs {
     }
 }
 
+/// Which charts a model trained, validated and was tested on, saved with it.
+#[derive(Serialize)]
+struct SplitRecord<'a> {
+    split_seed: u64,
+    train_ratio: f64,
+    valid_ratio: f64,
+    /// Each split in its own order (`test` in the order `train` prints its examples)
+    train: Vec<SplitChart<'a>>,
+    validation: Vec<SplitChart<'a>>,
+    test: Vec<SplitChart<'a>>,
+}
+
+#[derive(Serialize)]
+struct SplitChart<'a> {
+    chart: &'a str,
+    rating: f32,
+    simfile: String,
+    /// In the samples `train` loaded
+    #[serde(skip)]
+    row: usize,
+}
+
+impl<'a> SplitRecord<'a> {
+    /// `training`'s split of `samples`, as `ModelConfig::train` makes it.
+    fn new(samples: &'a [Sample], training: &TrainingConfig) -> SplitRecord<'a> {
+        let (train, validation, test) = train::split_rows(samples.len(), training);
+        let charts = |rows: Vec<usize>| -> Vec<SplitChart<'a>> {
+            let chart = |row: usize| {
+                let sample = &samples[row];
+                SplitChart { chart: &sample.name, rating: sample.rating, simfile: sample.simfile.display().to_string(), row }
+            };
+            rows.into_iter().map(chart).collect()
+        };
+        SplitRecord {
+            split_seed: training.split_seed,
+            train_ratio: training.train_ratio,
+            valid_ratio: training.valid_ratio,
+            train: charts(train),
+            validation: charts(validation),
+            test: charts(test),
+        }
+    }
+}
+
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
 /// chart in a folder of song folders (the argument, or the `DATASET` packs), and saves it to
-/// `--name`'s folder in `ARTIFACTS`, or a new `new_model_dir`.
+/// `--name`'s folder in `ARTIFACTS`, or a new `new_model_dir`, with its split (`SPLIT_FILE`).
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (name, songs) = take_option(args, "--name")?;
     // Before training, which takes minutes
@@ -151,7 +200,13 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     trained.save(&model_config, &dir)?;
     ModelInputs::now(feature_names).save(&dir)?;
-    say!("\nsaved the model to {}/\n", dir.display());
+    let split = SplitRecord::new(&samples, &training);
+    // Recomputed, so checked against the split trained on
+    if split.test.iter().map(|chart| chart.row).ne(test.rows.iter().copied()) {
+        return Err(format!("the split recomputed for {SPLIT_FILE} isn't the one trained on").into());
+    }
+    fs::write(dir.join(SPLIT_FILE), serde_json::to_string_pretty(&split)?)?;
+    say!("\nsaved the model and its split to {}/\n", dir.display());
 
     say!("{:<48} {:>6} {:>9}", "test chart", "rating", "predicted");
     for (&row, predicted) in test.rows.iter().zip(&test.predictions).take(EXAMPLES) {
@@ -346,10 +401,12 @@ fn option(name: &str) -> String {
 
 /// `analyze`'s arguments, and every cost and setting with its default.
 fn analyze_usage() -> String {
-    let mut usage = String::from(
+    let mut usage = format!(
         "usage: analyze <simfile> <difficulty> [--footing] [--<cost or setting> <value>]...\n\n\
          A simfile is a .sm or .ssc file, its song folder, or - for its text on stdin. --footing\n\
-         adds every note's footing and every technique found, by note.\n\ncosts (default):\n",
+         adds every note's footing and every technique found, by note. A cost's base or speed can\n\
+         be inf, which rules its event out unless there is no other way: it counts as {MAX_COST:e}, the\n\
+         most any does.\n\ncosts (default):\n",
     );
     let mut costs = COSTS;
     for (name, value) in costs.parameters() {
@@ -423,11 +480,14 @@ fn analyze_args(args: &[String]) -> Result<AnalyzeArgs<'_>, String> {
     }
 }
 
-/// Sets the cost called `name` (as in `Costs::parameters`), or says why `value` can't be it.
+/// Sets the cost called `name` (as in `Costs::parameters`), or says why `value` can't be it. A
+/// penalty over `MAX_COST`, infinity too, is set to it.
 fn set_cost(costs: &mut Costs, name: &str, value: f64) -> Result<(), String> {
+    // A time, and a speed. The rest are penalties.
+    let penalty = !matches!(name, "reference gap" | "max speed");
     let must = match name {
-        _ if !value.is_finite() => Some("a finite number"),
-        // A time, and a speed
+        _ if penalty && value == f64::INFINITY => None,
+        _ if !value.is_finite() => Some(if penalty { "a number or inf" } else { "a finite number" }),
         "reference gap" if value <= 0.0 => Some("more than 0"),
         "max speed" if value < 0.0 => Some("0 or more"),
         _ => None,
@@ -437,7 +497,7 @@ fn set_cost(costs: &mut Costs, name: &str, value: f64) -> Result<(), String> {
     }
     let mut parameters = costs.parameters();
     let (_, cost) = parameters.iter_mut().find(|(cost, _)| *cost == name).ok_or_else(|| format!("there is no cost called {name}"))?;
-    **cost = value;
+    **cost = if penalty { value.min(MAX_COST) } else { value };
     Ok(())
 }
 
@@ -1214,7 +1274,9 @@ fn load_samples(packs: &[PathBuf], cache: &mut StatsCache) -> Result<(Vec<String
                 let name = format!("{song_name} [{:?}]", chart.difficulty);
                 feature_names = chart.stats.features().into_iter().map(|(feature, _)| feature).collect();
                 match finite_features(&chart.stats) {
-                    Ok(features) => samples.push(Sample { name, features, rating: chart.rating as f32 }),
+                    Ok(features) => {
+                        samples.push(Sample { name, simfile: file.clone(), features, rating: chart.rating as f32 })
+                    }
                     Err(feature) => eprintln!("skipping {name}: its {feature} isn't a finite number"),
                 }
             }
@@ -1305,6 +1367,35 @@ mod tests {
         assert!(enough_charts(2, &config, 2).is_err());
         assert!(enough_charts(3, &config, 2).is_err());
         assert!(enough_charts(0, &config, 2).is_err());
+    }
+
+    #[test]
+    fn records_the_split_a_model_trained_on() {
+        let samples: Vec<Sample> = (0..20)
+            .map(|i| Sample {
+                name: format!("Song {} [Hard]", i),
+                simfile: PathBuf::from(format!("pack/Song {i}/Song {i}.sm")),
+                features: vec![0.0],
+                rating: (i % 19 + 1) as f32,
+            })
+            .collect();
+        let training = TrainingConfig::new().with_split_seed(7);
+        let split = SplitRecord::new(&samples, &training);
+        let rows = |charts: &[SplitChart]| charts.iter().map(|chart| chart.row).collect::<Vec<_>>();
+        let (train, validation, test) = train::split_rows(samples.len(), &training);
+        assert_eq!((rows(&split.train), rows(&split.validation), rows(&split.test)), (train, validation, test));
+        for chart in [&split.train, &split.validation, &split.test].into_iter().flatten() {
+            let sample = &samples[chart.row];
+            assert_eq!((chart.chart, chart.rating, chart.simfile.as_str()), (sample.name.as_str(), sample.rating, sample.simfile.to_str().unwrap()));
+        }
+
+        let json: serde_json::Value = serde_json::to_value(&split).unwrap();
+        assert_eq!((json["split_seed"].as_u64(), json["train_ratio"].as_f64(), json["valid_ratio"].as_f64()), (Some(7), Some(0.7), Some(0.15)));
+        let sizes = ["train", "validation", "test"].map(|name| json[name].as_array().unwrap().len());
+        assert_eq!(sizes, [14, 3, 3]);
+        let first = &json["test"][0];
+        let row = split.test[0].row;
+        assert_eq!(first, &serde_json::json!({"chart": format!("Song {row} [Hard]"), "rating": (row % 19 + 1) as f32, "simfile": format!("pack/Song {row}/Song {row}.sm")}));
     }
 
     #[test]
@@ -1476,7 +1567,10 @@ mod tests {
             (&["song.sm", "hard", "--jack"], "unknown option --jack"),
             (&["song.sm", "hard", "--jack-base"], "--jack-base needs a value"),
             (&["song.sm", "hard", "--jack-base", "x"], "--jack-base takes a number, not x"),
-            (&["song.sm", "hard", "--jack-base", "NaN"], "--jack-base must be a finite number, not NaN"),
+            (&["song.sm", "hard", "--jack-base", "NaN"], "--jack-base must be a number or inf, not NaN"),
+            (&["song.sm", "hard", "--jack-speed=-inf"], "--jack-speed must be a number or inf, not -inf"),
+            (&["song.sm", "hard", "--max-speed", "inf"], "--max-speed must be a finite number, not inf"),
+            (&["song.sm", "hard", "--reference-gap", "inf"], "--reference-gap must be a finite number, not inf"),
             (&["song.sm", "hard", "--jack-base", "1", "--jack-base=2"], "--jack-base is given twice"),
             (&["song.sm", "hard", "--reference-gap", "0"], "--reference-gap must be more than 0, not 0"),
             (&["song.sm", "hard", "--max-speed", "-1"], "--max-speed must be 0 or more, not -1"),
@@ -1491,6 +1585,11 @@ mod tests {
             assert!(message.contains(error), "{args:?}: {message}");
         }
         assert!(analyze_args(&strings(&["song.sm", "hard", "--max-speed", "0"])).is_ok());
+        // A penalty over the most one counts as, infinity too: set to that
+        let capped = strings(&["song.sm", "hard", "--sideswitch-base", "inf", "--jack-speed=1e30", "--bracket-base", "-1e30"]);
+        let mut expected = crate::chart_analyzer::COSTS;
+        (expected.sideswitch.base, expected.jack.speed, expected.bracket.base) = (MAX_COST, MAX_COST, -1e30);
+        assert_eq!(cost_values(analyze_args(&capped).unwrap().costs), cost_values(expected));
     }
 
     #[test]

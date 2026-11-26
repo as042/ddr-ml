@@ -213,17 +213,24 @@ impl Turning {
 }
 
 /// One kind of event's penalty: `base` at any speed, plus `speed` for each multiple of the
-/// reference speed (see `Costs::reference_gap`).
+/// reference speed (see `Costs::reference_gap`). Either can be infinite: see `MAX_COST`.
 #[derive(Debug, Clone, Copy)]
 pub struct Cost {
     pub base: f64,
     pub speed: f64,
 }
 
+/// Most an event costs, in points: more counts as this, infinity too. A segment's worth can't
+/// overflow: 18 million fit a u64 of thousandths.
+pub const MAX_COST: f64 = 1e9;
+
 impl Cost {
-    /// In thousandths.
+    /// In thousandths, `MAX_COST` at most.
     fn at(&self, speed: f64) -> u64 {
-        ((self.base + self.speed * speed) * COST_UNIT).round().max(0.0) as u64
+        // Capped first: an infinite `speed` adds nothing at speed 0
+        let cap = |points: f64| points.clamp(-MAX_COST, MAX_COST);
+        let points = cap(self.base) + cap(self.speed) * speed;
+        (points.clamp(0.0, MAX_COST) * COST_UNIT).round() as u64
     }
 }
 
@@ -1288,6 +1295,52 @@ pub(super) mod tests {
         assert_eq!((feet(&paused), paused.events), ("rllrlr".into(), events(0, 0, 0, 1, 0, 0, 0)));
         assert_eq!(paused.cost, COSTS.doublestep.base + COSTS.doublestep.speed * 0.25);
         assert_eq!(feet(&solve(&segment("R L . . . U R U R"), &flat, &WIDE)), "rlrlrl");
+    }
+
+    #[test]
+    fn caps_a_cost() {
+        let most = (MAX_COST * COST_UNIT) as u64;
+        assert_eq!(Cost { base: f64::INFINITY, speed: 0.0 }.at(1.0), most);
+        assert_eq!(Cost { base: 1e30, speed: 1e30 }.at(4.0), most);
+        assert_eq!(Cost { base: MAX_COST - 1.0, speed: 0.0 }.at(1.0), most - 1000);
+        // An infinite speed scaling: the most per unit of speed, so nothing at speed 0
+        assert_eq!(Cost { base: 0.5, speed: f64::INFINITY }.at(0.0), 500);
+        assert_eq!(Cost { base: 0.0, speed: f64::INFINITY }.at(0.5), most / 2);
+        assert_eq!(Cost { base: 0.5, speed: f64::INFINITY }.at(2.0), most);
+        // Never under 0
+        assert_eq!(Cost { base: f64::NEG_INFINITY, speed: 1.0 }.at(1.0), 0);
+
+        // Forced, each is paid in full: a repeated arrow is a jack or a sideswitch
+        let never = Cost { base: f64::INFINITY, speed: f64::INFINITY };
+        let forced = solve(&segment(&"L ".repeat(40)), &Costs { jack: never, sideswitch: never, ..COSTS }, &WIDE);
+        assert_eq!(forced.cost, 39.0 * MAX_COST);
+        assert_eq!(forced.note_costs[1..], [MAX_COST; 39]);
+    }
+
+    #[test]
+    fn an_infinite_cost_rules_out_a_sideswitch() {
+        // Come Back To Me (DDR A20 PLUS) Hard, measures 13 and 14 and the next note: a row per
+        // half beat at 172 BPM
+        let notes = at_speed("U . L . R . . . R . U . L . . L D", 172.0 / 240.0);
+        // The costs it was footed with
+        let costs = Costs {
+            jack: Cost { base: 0.0, speed: 2.0 },
+            sideswitch: Cost { base: 3.0, speed: 1.0 },
+            horizontal_crossover: Cost { base: 1.5, speed: 0.2 },
+            doublestep: Cost { base: 2.0, speed: 7.0 },
+            ..COSTS
+        };
+        // Measure 14: a crossover onto Left, and a sideswitch out of it
+        let crossed = solve(&notes, &costs, &WIDE);
+        assert_eq!(&feet(&crossed)[3..], "rlrlr");
+        assert_eq!(crossed.note_costs, [0.0, 0.0, 0.0, 0.358, 0.0, 1.572, 3.239, 0.0]);
+        assert_eq!(crossed.events, Events { sideswitches: 1, ..events(1, 0, 1, 0, 0, 0, 0) });
+        // No sideswitch: a doublestep onto Left, and a jack
+        let never = Costs { sideswitch: Cost { base: f64::INFINITY, speed: 1.0 }, ..costs };
+        let doubled = solve(&notes, &never, &WIDE);
+        assert_eq!(&feet(&doubled)[3..], "rlllr");
+        assert_eq!(doubled.note_costs, [0.0, 0.0, 0.0, 0.358, 0.0, 4.508, 0.478, 0.0]);
+        assert_eq!(doubled.events, events(2, 0, 0, 1, 0, 0, 0));
     }
 
     /// Facing each way in turn from the screen, then the turn ended: (full spins, half spins) and

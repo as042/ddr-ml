@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::sim_loader::{BPMChange, ChartDifficulty, Measure, Note, SimFile, SingleChart, StepChart, Stop};
 #[cfg(test)]
 pub use footing::{Cost, TEST_COSTS};
-pub use footing::{COSTS, Costs, Events, Foot, Solution};
+pub use footing::{COSTS, Costs, Events, Foot, MAX_COST, Solution};
 pub use statistics::ChartStatistics;
 pub use technique::{Source, Technique};
 

@@ -22,9 +22,9 @@ usage: ddr-trainer <tool> [arguments]
 
 tools:
   train [songs] [--name <name>]
-                               train a rating model on a folder of song folders and save it in
-                               artifacts/<name>/ (replacing what's there), or by default in a new
-                               artifacts/model_<UTC date>_<time>Z/
+                               train a rating model on a folder of song folders and save it, with
+                               its split, in artifacts/<name>/ (replacing what's there), or by
+                               default in a new artifacts/model_<UTC date>_<time>Z/
   pca [songs]                  fit a PCA of the chart statistics and save it
   infer [--model <name>] <simfile>...
                                rate each chart with the model saved in artifacts/<name>/, by
