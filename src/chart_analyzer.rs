@@ -113,7 +113,7 @@ pub fn analyze_singles(sim: &SimFile) -> Vec<AnalyzedChart> {
             StepChart::DanceSingle(single) => Some(AnalyzedChart {
                 difficulty: single.difficulty,
                 rating: single.rating,
-                stats: analyze_single_chart(single, &sim.bpms, &sim.stops, &COSTS, &SETTINGS),
+                stats: analyze_single_chart(single, &single.bpms, &single.stops, &COSTS, &SETTINGS),
             }),
             StepChart::DanceDouble(_) => None,
         })
@@ -462,7 +462,8 @@ mod tests {
 
     pub(super) fn stats(file: &str, difficulty: ChartDifficulty) -> ChartStatistics {
         let sim = load(file);
-        analyze_single_chart(single(&sim, difficulty), &sim.bpms, &sim.stops, &COSTS, &SETTINGS)
+        let chart = single(&sim, difficulty);
+        analyze_single_chart(chart, &chart.bpms, &chart.stops, &COSTS, &SETTINGS)
     }
 
     pub(super) fn assert_close(actual: f64, expected: f64, what: &str) {
@@ -486,28 +487,28 @@ mod tests {
             .collect();
         rows.resize(rows.len().next_multiple_of(16), [Note::Empty; 4]);
         let measures = rows.chunks(16).map(|rows| Measure { num_beats: 4, rows: rows.to_vec() }).collect();
-        SingleChart { difficulty: Hard, rating: 10.0, measures }
+        SingleChart { difficulty: Hard, rating: 10.0, measures, bpms: vec![BPMChange { beat: 0.0, bpm: 120.0 }], stops: Vec::new() }
     }
 
     #[test]
     fn every_setting_reaches_the_statistics() {
-        // Segments: a footing a search one branch wide gets wrong; one that spins when a turn can't
-        // go back at all; a stream and a drill straight into a slower stream, then a gallop
+        // Segments: a footing a search one branch wide gets wrong; one that turns right round by way
+        // of a lateral when a turn can't go back at all (each turn is then too short to be a spin);
+        // a stream and a drill straight into a slower stream, then a gallop
         let gap = ". ".repeat(24);
         let chart = sixteenths(&format!(
             "L D R L {gap} U L D R U L D R U L D R {gap} L R L R L R L R L R L R . L . D . U . R . L . D . U . R . . . . U D"
         ));
-        let bpms = [BPMChange { beat: 0.0, bpm: 120.0 }];
         // Crossovers cheap enough to hide a spin behind
         let costs = Costs { horizontal_crossover: Cost { base: 1.5, speed: 0.2 }, ..COSTS };
         let statistic = |settings: &Settings, name: &str| {
-            let features = analyze_single_chart(&chart, &bpms, &[], &costs, settings).features();
+            let features = analyze_single_chart(&chart, &chart.bpms, &chart.stops, &costs, settings).features();
             features.into_iter().find(|(feature, _)| feature == name).unwrap_or_else(|| panic!("no {name}")).1
         };
         let changes = [
             ("segment break seconds", 0.0, "stream_count"),
             ("max footing branches", 1.0, "mean_cost_per_note"),
-            ("turn back degrees", 0.0, "half_spin_count"),
+            ("turn back degrees", 0.0, "lateral_count"),
             ("window seconds", 10.0, "max_notes_per_second"),
             ("active gap seconds", 0.0, "longest_run_notes"),
             ("even tolerance", 1.0, "stream_count"),
@@ -560,7 +561,8 @@ mod tests {
     #[test]
     fn converts_rows_to_times() {
         let sim = load("nps_stats.sm");
-        let notes = to_timed_notes(&single(&sim, Easy).measures, &Timing::new(&sim.bpms, &sim.stops));
+        let chart = single(&sim, Easy);
+        let notes = to_timed_notes(&chart.measures, &Timing::new(&chart.bpms, &chart.stops));
         let expected = [
             0.0,
             0.5,
@@ -638,7 +640,7 @@ mod tests {
         let sim = load("footing_stats.sm");
         for chart in &sim.step_charts {
             let StepChart::DanceSingle(chart) = chart else { continue };
-            let footed = foot_chart(chart, &sim.bpms, &sim.stops, &COSTS);
+            let footed = foot_chart(chart, &chart.bpms, &chart.stops, &COSTS);
             let notes: usize = footed.iter().map(|segment| segment.notes.len()).sum();
             assert_eq!(notes, stats("footing_stats.sm", chart.difficulty).num_notes, "{:?}", chart.difficulty);
             for segment in &footed {
@@ -687,11 +689,11 @@ mod tests {
     #[test]
     fn splits_notes_into_segments() {
         let sim = load("footing_stats.sm");
-        let timing = Timing::new(&sim.bpms, &sim.stops);
         let expected: [(ChartDifficulty, &[usize]); 5] =
             [(Beginner, &[]), (Easy, &[5, 1]), (Medium, &[3, 3]), (Hard, &[4, 4]), (Challenge, &[6, 4, 6])];
         for (difficulty, lengths) in expected {
-            let notes = to_timed_notes(&single(&sim, difficulty).measures, &timing);
+            let chart = single(&sim, difficulty);
+            let notes = to_timed_notes(&chart.measures, &Timing::new(&chart.bpms, &chart.stops));
             let segments = segments(&notes, SETTINGS.segment_break_seconds);
             let actual: Vec<usize> = segments.iter().map(|segment| segment.len()).collect();
             assert_eq!(actual, lengths, "{difficulty:?}: notes in each segment");

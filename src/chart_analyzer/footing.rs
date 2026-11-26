@@ -53,8 +53,9 @@ pub struct Footing {
     pub horizontal_crossovers: usize,
     /// Steps into a lateral: left foot on Right, right foot on Left (facing away)
     pub laterals: usize,
-    /// Turns of 180 to 359 degrees in one direction (see `Turning`) that pass through facing away
-    /// (facing left round to facing right doesn't)
+    /// Turns of 180 to 359 degrees in one direction (see `Turning`) that go through facing away
+    /// and on past it. Facing left round to facing right doesn't, and nor does a turn that starts
+    /// or stops facing away: that is a lateral's turn, in or out.
     pub half_spins: usize,
     /// Full 360 degree turns in one direction (see `Turning`)
     pub full_spins: usize,
@@ -196,10 +197,13 @@ impl Turning {
             let (low, high) = (self.peak.min(self.turn_start), self.peak.max(self.turn_start));
             let turned = high - low;
             footing.full_spins += (turned / 360) as usize;
-            // A half spin has to pass through facing away. `away` is the first such angle (180,
-            // 540, ...) at or above `low`.
+            // What is left over the full spins is a half spin if it goes through facing away.
+            // Starting or stopping there doesn't count: that is the turn into or out of a
+            // lateral, which `State::settle` counts. `away` is the first such angle (180, 540,
+            // ...) at or above `low`.
+            let rest = turned % 360;
             let away = low + (180 - low).rem_euclid(360);
-            if turned % 360 >= 180 && away <= high {
+            if rest >= 180 && low < away && away < low + rest {
                 footing.half_spins += 1;
             }
             self.turn_start = self.peak;
@@ -1146,10 +1150,33 @@ pub(super) mod tests {
 
     #[test]
     fn avoids_a_lateral() {
-        // Left foot first: crossover, lateral and half spin. Right foot first: one crossover.
+        // Left foot first: a crossover and a lateral. Right foot first: one crossover.
         assert_eq!(solved("L D R L", &COSTS), ("rlrl".into(), events(0, 0, 1, 0, 0, 0, 0)));
         // The first two notes fix the feet, so a doublestep is the cheapest way out
         assert_eq!(solved("R L D R L", &COSTS), ("rlrrl".into(), events(0, 0, 0, 1, 0, 0, 0)));
+    }
+
+    #[test]
+    fn a_lateral_is_not_a_half_spin() {
+        // The first two notes fix the feet. With doublesteps priced out the feet alternate into
+        // a lateral on the second Left: half way round, facing away.
+        let alternating = Costs { doublestep: Cost { base: 30.0, speed: 0.0 }, ..COSTS };
+        // Out the way it came, by Up: a crossover and a lateral, and no spin there or back
+        let tokens = "R L D R L U R L R";
+        assert_eq!(solved(tokens, &alternating), ("rlrlrlrlr".into(), events(0, 0, 1, 0, 1, 0, 0)));
+        assert_eq!(facings(tokens, &alternating), [0, 0, 45, 135, 180, 135, 45, 0, 0]);
+        // So it costs a crossover and a lateral, less than the two doublesteps that avoid it
+        assert_eq!(solved(tokens, &COSTS), ("rlrlrlrlr".into(), events(0, 0, 1, 0, 1, 0, 0)));
+        // Out the other way, by Down: on round to the screen, one full spin
+        let tokens = "R L D R L D R L R";
+        assert_eq!(solved(tokens, &alternating), ("rlrlrlrlr".into(), events(0, 0, 1, 0, 1, 0, 1)));
+        assert_eq!(facings(tokens, &alternating).last(), Some(&360));
+        // Past facing away with no lateral, the right foot going from Down to Up behind the
+        // left: a half spin. Laterals are priced out too, or the feet would start crossed, in one.
+        let no_laterals = Costs { lateral: Cost { base: 30.0, speed: 0.0 }, ..alternating };
+        let tokens = "R L D R U";
+        assert_eq!(solved(tokens, &no_laterals), ("rlrlr".into(), candled(1, events(0, 0, 1, 0, 0, 1, 0))));
+        assert_eq!(facings(tokens, &no_laterals).last(), Some(&225));
     }
 
     #[test]
@@ -1183,12 +1210,15 @@ pub(super) mod tests {
         // Doublesteps, never facing away
         assert_eq!(solved(tokens, &COSTS), ("rlrrllrrllrl".into(), candled(1, events(0, 0, 1, 4, 0, 0, 0))));
         assert!(facings(tokens, &COSTS).iter().all(|facing| facing.abs() < 180));
-        // Cheap spins: alternates, round and round
+        // Cheap spins: alternates, round and round. Right foot first: two and a half times round
+        // from just left of the screen to a crossover, facing away twice, so two full spins. The
+        // half left over goes past the screen, which is no half spin. Left foot first would face
+        // away a third time.
         let spinner = Costs { half_spin: Cost { base: 1.0, speed: 0.0 }, full_spin: Cost { base: 1.0, speed: 0.0 }, ..COSTS };
-        assert_eq!(solved(tokens, &spinner), ("lrlrlrlrlrlr".into(), candled(5, events(0, 0, 3, 0, 0, 1, 2))));
+        assert_eq!(solved(tokens, &spinner), ("rlrlrlrlrlrl".into(), candled(5, events(0, 0, 3, 0, 0, 0, 2))));
         let turned = facings(tokens, &spinner);
-        assert!(turned.windows(2).all(|pair| pair[1] > pair[0]), "{turned:?}: one way round");
-        assert_eq!(turned.last(), Some(&1035));
+        assert!(turned.windows(2).all(|pair| pair[1] >= pair[0]), "{turned:?}: one way round");
+        assert_eq!((turned.first(), turned.last()), (Some(&-45), Some(&855)));
     }
 
     /// `tokens` with the notes `times` as fast.
@@ -1295,11 +1325,32 @@ pub(super) mod tests {
         // 45 back at 180: one turn of 405
         assert_eq!(turned(&[90, 180, 135, -135, -45, 45]), ((1, 0), Some(405)));
         assert_eq!(turned(&[-90, 180, -135, 135, 45, -45]), ((1, 0), Some(-405)));
-        // 90 back at 180, then 90 forward again: three turns
-        assert_eq!(turned(&[90, 180, 90, 180, -90, 0, 90]), ((1, 1), Some(450)));
-        // None allowed back: 45 back ends a turn too. Up to 90 allowed: 90 back doesn't.
-        assert_eq!(turned_back(&[90, 180, 135, -135, -45, 45], 0), ((0, 2), Some(405)));
-        assert_eq!(turned_back(&[90, 180, 90, 180, -90, 0, 90], 90), ((1, 0), Some(450)));
+        // 90 back from past 180, then 90 forward again: three turns. A half spin to 225, and
+        // another from 135 on round to 405.
+        assert_eq!(turned(&[90, 180, -135, 135, -135, -45, 45]), ((0, 2), Some(405)));
+        // None allowed back: 45 back ends a turn too, here at 180, which is no spin. Up to 90
+        // allowed: 90 back doesn't.
+        assert_eq!(turned_back(&[90, 180, 135, -135, -45, 45], 0), ((0, 1), Some(405)));
+        assert_eq!(turned_back(&[90, 180, -135, 135, -135, -45, 45], 90), ((1, 0), Some(405)));
+    }
+
+    #[test]
+    fn a_turn_that_stops_or_starts_facing_away_is_no_half_spin() {
+        // Half way round to facing away and no further, either way: the turn into a lateral
+        assert_eq!(turned(&[90, 180]), ((0, 0), Some(180)));
+        assert_eq!(turned(&[-90, 180]), ((0, 0), Some(-180)));
+        // And the turn back out of it, to the screen or on past the screen
+        assert_eq!(turned(&[90, 180, 90, 0]), ((0, 0), Some(0)));
+        assert_eq!(turned(&[90, 180, 90, 0, -90]), ((0, 0), Some(-90)));
+        // On past facing away is a half spin
+        assert_eq!(turned(&[90, 180, -135]), ((0, 1), Some(225)));
+        assert_eq!(turned(&[-90, 180, 135]), ((0, 1), Some(-225)));
+        // A full spin and on to facing away: no half spin with it. On past facing away: one.
+        assert_eq!(turned(&[90, 180, -90, 0, 90, 180]), ((1, 0), Some(540)));
+        assert_eq!(turned(&[90, 180, -90, 0, 90, 180, -135]), ((1, 1), Some(585)));
+        // From facing left, a full spin and on round to facing right: the half left over goes
+        // past the screen, as it would without the full spin
+        assert_eq!(turned(&[-90, 0, 90, 180, -90, 0, 90]), ((1, 0), Some(450)));
     }
 
     #[test]
@@ -1626,33 +1677,30 @@ pub(super) mod tests {
         notes: Vec<TimedNote>,
     }
 
-    /// The dance-single charts of the .sm files under `DDR_SONGS`, a folder of song folders.
+    /// The dance-single charts of the simfiles under `DDR_SONGS`, a folder of song folders.
     fn song_charts() -> Vec<SongChart> {
         use super::super::{Timing, to_timed_notes};
-        use crate::sim_loader::{SimFile, StepChart};
+        use crate::sim_loader::{SimFile, StepChart, simfiles_in};
 
         let songs = std::env::var("DDR_SONGS").expect("DDR_SONGS: folder of song folders");
         let mut paths: Vec<_> = std::fs::read_dir(songs)
             .expect("a readable folder")
             .flatten()
             .filter(|entry| entry.path().is_dir())
-            .flat_map(|entry| std::fs::read_dir(entry.path()).expect("a readable folder").flatten())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "sm"))
+            .flat_map(|entry| simfiles_in(&entry.path()).expect("a readable folder"))
             .collect();
         paths.sort();
 
         let mut charts = Vec::new();
         for path in paths {
             let Ok(sim) = SimFile::from_file(&path) else { continue };
-            let timing = Timing::new(&sim.bpms, &sim.stops);
             for chart in &sim.step_charts {
                 let StepChart::DanceSingle(chart) = chart else { continue };
                 charts.push(SongChart {
                     title: sim.title.clone(),
                     difficulty: format!("{:?}", chart.difficulty),
                     rating: chart.rating.to_string(),
-                    notes: to_timed_notes(&chart.measures, &timing),
+                    notes: to_timed_notes(&chart.measures, &Timing::new(&chart.bpms, &chart.stops)),
                 });
             }
         }

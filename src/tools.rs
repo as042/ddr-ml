@@ -26,7 +26,7 @@ use crate::dataset::Dataset;
 use crate::device::DevicePreference;
 use crate::model::ModelConfig;
 use crate::pca::Pca;
-use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart};
+use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart, simfiles_in};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, TrainedModel, TrainingConfig};
 
@@ -35,7 +35,13 @@ const MODEL_DIR: &str = "artifacts/a3_model3/";
 /// In `MODEL_DIR` (see `ModelInputs`).
 const INPUTS_FILE: &str = "inputs.json";
 const PCA_FILE: &str = "artifacts/pca.json";
-/// Puts all 4 [ ]DENTITY charts in the test split.
+/// Untracked (copyrighted), see data/.gitignore.
+const PACKS_DIR: &str = "data/packs";
+/// Default training data, oldest first. Checked 2026-11-25: no song in two packs.
+const DATASET: [&str; 5] = ["DDR A (AC INTL)", "DDR A20 (AC INTL)", "DDR A20 PLUS (AC INTL)", "DDR A3 (AC INTL)", "DDR WORLD (AC INTL)"];
+/// The pack the chart spreadsheet counts.
+const SHEET_PACK: &str = "DDR A3 (AC INTL)";
+/// Picked on DDR A3 alone, where it put all 4 [ ]DENTITY charts in the test split.
 const SPLIT_SEED: u64 = 643;
 /// Test-set predictions to print at the end.
 const EXAMPLES: usize = 12;
@@ -109,9 +115,10 @@ impl ModelInputs {
 }
 
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
-/// chart in a folder of song folders (the argument, or DDR A3), and saves it to `MODEL_DIR`.
+/// chart in a folder of song folders (the argument, or the `DATASET` packs), and saves it to
+/// `MODEL_DIR`.
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (feature_names, samples) = cached_samples(&songs_folder(args)?)?;
+    let (feature_names, samples) = cached_samples(&song_packs(args)?)?;
 
     // Small batches: with only a few hundred charts, they make more steps per epoch.
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
@@ -150,10 +157,10 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Fits a PCA of the chart statistics of a folder of song folders (the argument, or DDR A3) on
-/// the split `train` trains on, prints it and saves it to `PCA_FILE`.
+/// Fits a PCA of the chart statistics of a folder of song folders (the argument, or the
+/// `DATASET` packs) on the split `train` trains on, prints it and saves it to `PCA_FILE`.
 pub fn pca(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (feature_names, samples) = cached_samples(&songs_folder(args)?)?;
+    let (feature_names, samples) = cached_samples(&song_packs(args)?)?;
     report_pca(&feature_names, &samples)
 }
 
@@ -265,8 +272,8 @@ fn option(name: &str) -> String {
 fn analyze_usage() -> String {
     let mut usage = String::from(
         "usage: analyze <simfile> <difficulty> [--footing] [--<cost or setting> <value>]...\n\n\
-         A simfile is a .sm file, its song folder, or - for its text on stdin. --footing adds every\n\
-         note's footing and every technique found, by note.\n\ncosts (default):\n",
+         A simfile is a .sm or .ssc file, its song folder, or - for its text on stdin. --footing\n\
+         adds every note's footing and every technique found, by note.\n\ncosts (default):\n",
     );
     let mut costs = COSTS;
     for (name, value) in costs.parameters() {
@@ -539,7 +546,7 @@ fn analysis_json(sim: &SimFile, difficulty: &str, costs: &Costs, settings: &Sett
         }
         _ => return Err(format!("{} has {} {difficulty} charts", sim.title, matching.len())),
     };
-    let analysis = analyze_chart(chart, &sim.bpms, &sim.stops, costs, settings);
+    let analysis = analyze_chart(chart, &chart.bpms, &chart.stops, costs, settings);
     let mut costs = *costs;
     let analysis = Analysis {
         title: &sim.title,
@@ -702,11 +709,11 @@ pub fn fit_costs(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The charts of a tool's songs (its second argument, or DDR A3) that its sheet (the first) has
-/// counts for.
+/// The charts of a tool's songs (its second argument, or `SHEET_PACK`) that its sheet (the
+/// first) has counts for.
 fn charts_in_sheet(args: &[String], tool: &str) -> Result<Vec<cost_fit::Chart>, Box<dyn Error>> {
     let (sheet, songs) = match args {
-        [sheet] => (sheet, default_songs_folder()),
+        [sheet] => (sheet, pack_folder(SHEET_PACK)?),
         [sheet, songs] => (sheet, PathBuf::from(songs)),
         _ => return Err(format!("{tool} needs a chart spreadsheet (.csv), and maybe a folder of song folders").into()),
     };
@@ -774,7 +781,7 @@ fn sheet_charts(songs: &Path, sheet: &Sheet) -> Result<Vec<cost_fit::Chart>, Box
                 match sheet.counts(&sim.title, chart.difficulty) {
                     Some(counts) => charts.push(cost_fit::Chart {
                         song: song_index,
-                        segments: footing_segments(chart, &sim.bpms, &sim.stops),
+                        segments: footing_segments(chart, &chart.bpms, &chart.stops),
                         sheet: counts,
                     }),
                     None => missing += 1,
@@ -789,7 +796,7 @@ fn sheet_charts(songs: &Path, sheet: &Sheet) -> Result<Vec<cost_fit::Chart>, Box
     Ok(charts)
 }
 
-/// A song folder with at least one `.sm` file.
+/// A song folder with at least one simfile.
 struct SongFolder {
     /// Its place among all the song folders, in name order
     index: usize,
@@ -798,25 +805,22 @@ struct SongFolder {
     simfiles: Vec<PathBuf>,
 }
 
-/// The song folders in `songs`, in name order. One with no `.sm` file is left out with a
-/// warning, which says if it has a `.ssc` (not read), and so is their number.
+/// The song folders in `songs`, in name order, with their simfiles (`simfiles_in`). One with
+/// none is left out with a warning, and so is their number.
 fn song_folders(songs: &Path) -> io::Result<Vec<SongFolder>> {
-    let has = |path: &Path, extension: &str| path.extension().is_some_and(|ext| ext == extension);
     let (mut folders, mut skipped) = (Vec::new(), 0);
     for (index, song) in sorted_paths(songs)?.into_iter().filter(|path| path.is_dir()).enumerate() {
         let name = song.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let files = sorted_paths(&song)?;
-        let simfiles: Vec<PathBuf> = files.iter().filter(|path| has(path, "sm")).cloned().collect();
+        let simfiles = simfiles_in(&song)?;
         if simfiles.is_empty() {
-            let why = if files.iter().any(|path| has(path, "ssc")) { "only a .ssc, which isn't read" } else { "no simfile" };
-            eprintln!("skipping {name}: no .sm file ({why})");
+            eprintln!("skipping {name}: no .ssc or .sm file");
             skipped += 1;
             continue;
         }
         folders.push(SongFolder { index, name, simfiles });
     }
     if skipped > 0 {
-        eprintln!("{skipped} of the {} song folders in {} have no .sm file", folders.len() + skipped, songs.display());
+        eprintln!("{skipped} of the {} song folders in {} have no simfile", folders.len() + skipped, songs.display());
     }
     Ok(folders)
 }
@@ -855,7 +859,7 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
         say!("{} by {}", sim.title, sim.artist);
         say!("{:<10} {:>6} {:>6} {:>9}  footing; patterns", "chart", "rating", "notes", "segments");
         for chart in singles {
-            let footed = foot_chart(chart, &sim.bpms, &sim.stops, &COSTS);
+            let footed = foot_chart(chart, &chart.bpms, &chart.stops, &COSTS);
             let summary = Summary::of(&footed);
             say!(
                 "{:<10} {:>6} {:>6} {:>9}  {}; {}",
@@ -875,7 +879,7 @@ fn feet_of_simfile(path: &str, difficulty: Option<&str>) -> Result<(), Box<dyn E
         let names: Vec<String> = singles.iter().map(|chart| name(chart)).collect();
         format!("{} has no {difficulty} chart (it has {})", sim.title, names.join(", "))
     })?;
-    let footed = foot_chart(chart, &sim.bpms, &sim.stops, &COSTS);
+    let footed = foot_chart(chart, &chart.bpms, &chart.stops, &COSTS);
     let summary = Summary::of(&footed);
     let mut report = format!(
         "{} [{}], rated {}: {} notes in {} segments\n{}\n{}\n{}\n",
@@ -1061,36 +1065,39 @@ fn footing_table(segment: &FootedSegment, by_measure: bool) -> String {
     table
 }
 
-/// The folder of song folders a tool was given, or DDR A3.
-fn songs_folder(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
+/// The folders of song folders a tool reads: the one it was given, or the `DATASET` packs.
+fn song_packs(args: &[String]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     match args {
-        [] => Ok(default_songs_folder()),
-        [songs] => Ok(PathBuf::from(songs)),
+        [] => DATASET.iter().map(|pack| pack_folder(pack)).collect(),
+        [songs] => Ok(vec![PathBuf::from(songs)]),
         _ => Err("expected one folder of song folders at most".into()),
     }
 }
 
-/// DDR A3's songs in this machine's ITGmania install.
-fn default_songs_folder() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    Path::new(&home).join("Documents/ITGmania-0.9.0-Linux/itgmania/Songs/A3")
+/// A pack's folder in `PACKS_DIR`, if it's there.
+fn pack_folder(pack: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let folder = Path::new(PACKS_DIR).join(pack);
+    match folder.is_dir() {
+        true => Ok(folder),
+        false => Err(format!("{} not found (run from the repo, with the dataset's packs in {PACKS_DIR})", folder.display()).into()),
+    }
 }
 
 /// `load_samples` through the statistics cache in `CACHE_FILE`, which it updates.
-fn cached_samples(songs: &Path) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
+fn cached_samples(packs: &[PathBuf]) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut cache = StatsCache::load(CACHE_FILE)?;
-    let (feature_names, samples) = load_samples(songs, &mut cache)?;
+    let (feature_names, samples) = load_samples(packs, &mut cache)?;
+    let songs = packs.iter().map(|pack| pack.display().to_string()).collect::<Vec<_>>().join(", ");
     if samples.is_empty() {
-        return Err(format!("no dance-single charts found in {}", songs.display()).into());
+        return Err(format!("no dance-single charts found in {songs}").into());
     }
     if let Some(dir) = Path::new(CACHE_FILE).parent() {
         fs::create_dir_all(dir)?;
     }
     cache.save(CACHE_FILE)?;
     say!(
-        "{} charts from {} ({} files from the cache, {} analyzed), {} features each",
+        "{} charts from {songs} ({} files from the cache, {} analyzed), {} features each",
         samples.len(),
-        songs.display(),
         cache.hits(),
         cache.misses(),
         samples[0].features.len()
@@ -1107,16 +1114,17 @@ fn finite_features(stats: &ChartStatistics) -> Result<Vec<f32>, String> {
     }
 }
 
-/// Every dance-single chart in the `.sm` files of the song folders in `songs`. Folders with no
-/// `.sm`, files that don't load, and charts with a non-finite statistic, are skipped with a
-/// warning.
+/// Every dance-single chart in the simfiles of the song folders in `packs`, pack by pack.
+/// Folders with no simfile, files that don't load, and charts with a non-finite statistic, are
+/// skipped with a warning.
 ///
 /// Read in sorted order: listing order differs between machines, and would change the seeded
 /// split.
-fn load_samples(songs: &Path, cache: &mut StatsCache) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
+fn load_samples(packs: &[PathBuf], cache: &mut StatsCache) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut feature_names = Vec::new();
     let mut samples = Vec::new();
-    for song in song_folders(songs)? {
+    let songs = packs.iter().map(|pack| song_folders(pack)).collect::<io::Result<Vec<_>>>()?;
+    for song in songs.into_iter().flatten() {
         let song_name = song.name;
         for file in song.simfiles {
             let charts = match cache.analyze_file(&file) {
@@ -1224,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_song_folders_and_skips_those_with_no_sm() {
+    fn lists_song_folders_and_skips_those_with_no_simfile() {
         let songs = std::env::temp_dir().join(format!("ddr-trainer-song-folders-{}", std::process::id()));
         let file = |path: &str| {
             let path = songs.join(path);
@@ -1234,7 +1242,11 @@ mod tests {
         file("Alpha/alpha.sm");
         file("Alpha/alpha.ogg");
         file("Beta/beta.ssc");
+        file("Delta/two.sm");
+        file("Delta/one.SM");
+        fs::create_dir_all(songs.join("Delta/folder.ssc")).unwrap();
         fs::create_dir_all(songs.join("Empty")).unwrap();
+        // The .ssc over the .sm files
         file("Gamma/two.sm");
         file("Gamma/one.sm");
         file("Gamma/gamma.ssc");
@@ -1248,8 +1260,17 @@ mod tests {
                 (folder.index, folder.name.as_str(), names.collect())
             })
             .collect();
-        // Beta (1) and Empty (2) are left out, and keep their places in the count
-        assert_eq!(listed, [(0, "Alpha", vec!["alpha.sm".to_string()]), (3, "Gamma", vec!["one.sm".to_string(), "two.sm".to_string()])]);
+        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        // Empty (3) is left out, and keeps its place in the count
+        assert_eq!(
+            listed,
+            [
+                (0, "Alpha", names(&["alpha.sm"])),
+                (1, "Beta", names(&["beta.ssc"])),
+                (2, "Delta", names(&["one.SM", "two.sm"])),
+                (4, "Gamma", names(&["gamma.ssc"]))
+            ]
+        );
         fs::remove_dir_all(&songs).unwrap();
         assert!(song_folders(&songs).is_err());
     }
@@ -1393,7 +1414,7 @@ mod tests {
             assert!(text.contains(&branches), "{branches}");
 
             // Every statistic, as the analyzer gives it with these costs and settings, in its order
-            let expected = analyze_single_chart(challenge, &sim.bpms, &sim.stops, &costs, &settings).features();
+            let expected = analyze_single_chart(challenge, &challenge.bpms, &challenge.stops, &costs, &settings).features();
             let features = &text[text.find("\"features\"").unwrap()..];
             let mut last = 0;
             for (name, value) in &expected {
@@ -1441,7 +1462,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let analysis = analyze_chart(challenge, &sim.bpms, &sim.stops, &COSTS, &SETTINGS);
+        let analysis = analyze_chart(challenge, &challenge.bpms, &challenge.stops, &COSTS, &SETTINGS);
         let footed = analysis
             .segments
             .iter()

@@ -16,21 +16,24 @@ pub struct SimFile {
     offset: f64,
     sample_start: f64,
     sample_length: f64,
-    pub bpms: Vec<BPMChange>,
+    /// The song's timing. A chart has its own copy, or its own timing (`.ssc`).
+    bpms: Vec<BPMChange>,
     /// In file order.
-    pub stops: Vec<Stop>,
+    stops: Vec<Stop>,
     bg_stage: String,
 
     /// Note information for each chart
     pub step_charts: Vec<StepChart>,
 }
 
+#[derive(Clone)]
 pub struct BPMChange {
     /// Can be fractional (`64.5=300`).
     pub beat: f64,
     pub bpm: f64,
 }
 
+#[derive(Clone)]
 pub struct Stop {
     /// Can be fractional.
     pub beat: f64,
@@ -46,6 +49,10 @@ pub struct SingleChart {
     pub difficulty: ChartDifficulty,
     pub rating: f64,
     pub measures: Vec<Measure>,
+    /// The song's, unless the chart has its own (`.ssc`).
+    pub bpms: Vec<BPMChange>,
+    /// In file order.
+    pub stops: Vec<Stop>,
 }
 
 /// Not yet implemented.
@@ -64,8 +71,8 @@ pub enum ChartDifficulty {
 }
 
 pub struct Measure {
-    /// Always 4 in .sm files (no time signatures). Rows split the beats evenly: 16 rows are
-    /// 16th notes.
+    /// Always 4, as in StepMania: `.ssc` time signatures only move measure lines. Rows split the
+    /// beats evenly: 16 rows are 16th notes.
     pub num_beats: usize,
     pub rows: Vec<[Note; 4]>,
 }
@@ -82,22 +89,29 @@ pub enum Note {
     Mine,
 }
 
-/// `path` itself, or for a song folder, the `.sm` file in it named after the folder.
+/// `path` itself, or for a song folder, the simfile in it named after the folder: its `.ssc`,
+/// or else its `.sm`, as StepMania picks.
 pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let mut file_path = None;
     if path.as_ref().is_dir() {
         let abs_dir = path.as_ref().canonicalize()?;
         let dir_name = abs_dir.file_name().ok_or(io::Error::other("Could not parse file name"))?;
 
+        // [.ssc, .sm]
+        let mut found = [None, None];
         for entry in fs::read_dir(path)?.flatten() {
             let entry_path = entry.path();
-
             // The folder's audio and images are named after it too
-            let is_sm = entry_path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("sm"));
-            if entry_path.is_file() && is_sm && entry_path.file_stem() == Some(dir_name) {
-                file_path = Some(entry_path);
+            if !entry_path.is_file() || entry_path.file_stem() != Some(dir_name) {
+                continue;
             }
-         }
+            for (slot, simfile) in found.iter_mut().zip(["ssc", "sm"]) {
+                if entry_path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case(simfile)) {
+                    *slot = Some(entry_path.clone());
+                }
+            }
+        }
+        file_path = found.into_iter().flatten().next();
     }
     else if path.as_ref().is_file() {
         file_path = Some(path.as_ref().to_path_buf());
@@ -105,14 +119,36 @@ pub(crate) fn simfile_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     file_path.ok_or(io::Error::new(ErrorKind::NotFound, "Failed to determine path"))
 }
 
+/// A song folder's simfiles in name order: its `.ssc` files, or else its `.sm` files. StepMania
+/// reads the `.ssc` first, and a folder with both usually has the same song in each.
+pub(crate) fn simfiles_in(folder: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(folder)? {
+        files.push(entry?.path());
+    }
+    files.sort();
+    let with = |simfile: &str| -> Vec<PathBuf> {
+        let is = |path: &&PathBuf| path.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case(simfile));
+        files.iter().filter(is).cloned().collect()
+    };
+    let ssc = with("ssc");
+    Ok(if ssc.is_empty() { with("sm") } else { ssc })
+}
+
 impl SimFile {
-    /// Load the entire contents of a simfile (.sm) into memory. Can select a file or the containing directory if they share the same name.
+    /// Load the entire contents of a simfile (.sm or .ssc) into memory. Can select a file or the containing directory if they share the same name.
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         SimFile::parse(&fs::read_to_string(simfile_path(path)?)?)
     }
 
+    /// An `.sm` or an `.ssc`, told apart by content: an `.ssc` chart is a `#NOTEDATA` block of
+    /// tags, an `.sm` one a single `#NOTES` tag.
     pub fn parse(content: &str) -> io::Result<Self> {
         let mut sim = SimFile::default();
+        // With a chart's own timing, if it has some
+        let mut charts: Vec<(StepChart, Option<OwnTiming>)> = Vec::new();
+        // An open `.ssc` chart
+        let mut block: Option<ChartBlock> = None;
 
         // A tag (`#NAME:value;`) can span lines, so they collect in `pending` until a `;`.
         let mut pending = String::new();
@@ -136,9 +172,25 @@ impl SimFile {
                 let Some(start) = tag.find('#') else { continue };
                 let tag = &tag[start + 1..end];
                 let (name, value) = tag.split_once(':').unwrap_or((tag, ""));
+                let name = name.trim().to_ascii_uppercase();
                 let value = value.trim();
 
-                match name.trim().to_ascii_uppercase().as_str() {
+                if name == "NOTEDATA" {
+                    if block.is_some() {
+                        return Err(invalid("#NOTEDATA: the chart before it has no #NOTES"));
+                    }
+                    block = Some(ChartBlock::default());
+                    continue;
+                }
+                if let Some(chart) = &mut block {
+                    if chart.read(&name, value)?
+                        && let Some(chart) = block.take()
+                    {
+                        charts.extend(chart.finish(value)?);
+                    }
+                    continue;
+                }
+                match name.as_str() {
                     "TITLE" => sim.title = value.to_string(),
                     "ARTIST" => sim.artist = value.to_string(),
                     "ARTISTTRANSLIT" => sim.artist_translit = value.to_string(),
@@ -149,22 +201,11 @@ impl SimFile {
                     "OFFSET" => sim.offset = parse_number_or_zero("#OFFSET", value)?,
                     "SAMPLESTART" => sim.sample_start = parse_number_or_zero("#SAMPLESTART", value)?,
                     "SAMPLELENGTH" => sim.sample_length = parse_number_or_zero("#SAMPLELENGTH", value)?,
-                    "BPMS" => {
-                        let bpms = parse_beat_pairs("#BPMS", value)?;
-                        if let Some((beat, bpm)) = bpms.iter().find(|&&(_, bpm)| bpm <= 0.0) {
-                            return Err(invalid(format!("#BPMS: a BPM must be above 0, got {bpm} on beat {beat}{WARP}")));
-                        }
-                        sim.bpms = bpms.into_iter().map(|(beat, bpm)| BPMChange { beat, bpm }).collect()
-                    }
-                    "STOPS" => {
-                        let stops = parse_beat_pairs("#STOPS", value)?;
-                        if let Some((beat, seconds)) = stops.iter().find(|&&(_, seconds)| seconds < 0.0) {
-                            return Err(invalid(format!("#STOPS: a stop can't be negative, got {seconds} on beat {beat}{WARP}")));
-                        }
-                        sim.stops = stops.into_iter().map(|(beat, seconds)| Stop { beat, seconds }).collect()
-                    }
+                    "BPMS" => sim.bpms = parse_bpms(value)?,
+                    "STOPS" => sim.stops = parse_stops(value)?,
+                    "DELAYS" | "WARPS" | "FAKES" => unsupported_timing(&name, value)?,
                     "BGSTAGE" => sim.bg_stage = value.to_string(),
-                    "NOTES" => sim.step_charts.extend(parse_chart(value)?),
+                    "NOTES" => charts.extend(parse_sm_chart(value)?.map(|chart| (chart, None))),
                     _ => {} // Unused tags, such as #SUBTITLE
                 }
             }
@@ -173,10 +214,67 @@ impl SimFile {
         if pending.contains('#') {
             return Err(invalid("the file ends in the middle of a tag (missing ';')"));
         }
+        if block.is_some() {
+            return Err(invalid("the file ends in a chart with no #NOTES"));
+        }
         if sim.bpms.is_empty() {
             return Err(invalid("missing #BPMS"));
         }
+        for (mut chart, own) in charts {
+            if let StepChart::DanceSingle(single) = &mut chart {
+                (single.bpms, single.stops) = own.unwrap_or_else(|| (sim.bpms.clone(), sim.stops.clone()));
+            }
+            sim.step_charts.push(chart);
+        }
         Ok(sim)
+    }
+}
+
+/// A chart's own BPMs and stops.
+type OwnTiming = (Vec<BPMChange>, Vec<Stop>);
+
+/// An `.ssc` chart's tags, from its `#NOTEDATA` to its `#NOTES`.
+#[derive(Default)]
+struct ChartBlock {
+    step_type: String,
+    difficulty: String,
+    meter: String,
+    bpms: Option<Vec<BPMChange>>,
+    stops: Option<Vec<Stop>>,
+}
+
+impl ChartBlock {
+    /// Takes one of the chart's tags. True for its `#NOTES`, the last.
+    fn read(&mut self, name: &str, value: &str) -> io::Result<bool> {
+        match name {
+            "STEPSTYPE" => self.step_type = value.to_string(),
+            "DIFFICULTY" => self.difficulty = value.to_string(),
+            "METER" => self.meter = value.to_string(),
+            "BPMS" => self.bpms = Some(parse_bpms(value)?),
+            "STOPS" => self.stops = Some(parse_stops(value)?),
+            "DELAYS" | "WARPS" | "FAKES" => unsupported_timing(name, value)?,
+            // Routine charts' second player
+            "NOTES" | "NOTES2" => return Ok(true),
+            _ => {} // Unused tags, such as #CHARTNAME and the cosmetic #TIMESIGNATURES
+        }
+        Ok(false)
+    }
+
+    /// The chart, with `note_data`. A chart with BPMs or stops of its own uses only its own
+    /// timing, as in StepMania: no stops, if it has BPMs but no stops.
+    fn finish(self, note_data: &str) -> io::Result<Option<(StepChart, Option<OwnTiming>)>> {
+        let Some(chart) = parse_chart(&self.step_type, &self.difficulty, &self.meter, note_data, SSC_FIELDS)? else {
+            return Ok(None);
+        };
+        let own = match (self.bpms, self.stops) {
+            (None, None) => None,
+            (Some(bpms), stops) if !bpms.is_empty() => Some((bpms, stops.unwrap_or_default())),
+            _ => {
+                let chart = format!("{} {}", self.step_type, self.difficulty);
+                return Err(invalid(format!("#NOTEDATA ({chart}): timing of its own, but no #BPMS")));
+            }
+        };
+        Ok(Some((chart, own)))
     }
 }
 
@@ -212,35 +310,77 @@ fn parse_beat_pairs(tag: &str, value: &str) -> io::Result<Vec<(f64, f64)>> {
         .collect()
 }
 
-/// One `#NOTES` value: `step type:description:difficulty:meter:groove radar values:note data`.
-/// `None` for charts `StepChart` can't hold: other step types and Edit charts.
-fn parse_chart(value: &str) -> io::Result<Option<StepChart>> {
+fn parse_bpms(value: &str) -> io::Result<Vec<BPMChange>> {
+    let bpms = parse_beat_pairs("#BPMS", value)?;
+    if let Some((beat, bpm)) = bpms.iter().find(|&&(_, bpm)| bpm <= 0.0) {
+        return Err(invalid(format!("#BPMS: a BPM must be above 0, got {bpm} on beat {beat}{WARP}")));
+    }
+    Ok(bpms.into_iter().map(|(beat, bpm)| BPMChange { beat, bpm }).collect())
+}
+
+fn parse_stops(value: &str) -> io::Result<Vec<Stop>> {
+    let stops = parse_beat_pairs("#STOPS", value)?;
+    if let Some((beat, seconds)) = stops.iter().find(|&&(_, seconds)| seconds < 0.0) {
+        return Err(invalid(format!("#STOPS: a stop can't be negative, got {seconds} on beat {beat}{WARP}")));
+    }
+    Ok(stops.into_iter().map(|(beat, seconds)| Stop { beat, seconds }).collect())
+}
+
+/// Delays, warps and fakes change which notes are hit when. Empty is fine: StepMania writes
+/// `#WARPS:;` and the like into every `.ssc`.
+fn unsupported_timing(name: &str, value: &str) -> io::Result<()> {
+    match value.is_empty() {
+        true => Ok(()),
+        false => Err(invalid(format!("#{name}: {value:?} (delays, warps and fakes aren't supported)"))),
+    }
+}
+
+/// Where a chart's difficulty and meter come from, for errors.
+type ChartFields = (&'static str, &'static str);
+const SM_FIELDS: ChartFields = ("#NOTES", "#NOTES meter");
+const SSC_FIELDS: ChartFields = ("#DIFFICULTY", "#METER");
+
+/// One `.sm` `#NOTES` value: `step type:description:difficulty:meter:groove radar values:note data`.
+fn parse_sm_chart(value: &str) -> io::Result<Option<StepChart>> {
     let fields: Vec<&str> = value.splitn(6, ':').map(str::trim).collect();
     let &[step_type, _description, difficulty_name, meter, _radar, note_data] = fields.as_slice() else {
         return Err(invalid(format!("#NOTES: expected 6 ':'-separated fields, got {}", fields.len())));
     };
+    parse_chart(step_type, difficulty_name, meter, note_data, SM_FIELDS)
+}
 
+/// `None` for charts `StepChart` can't hold: other step types and Edit charts. Timing comes
+/// later.
+fn parse_chart(
+    step_type: &str,
+    difficulty_name: &str,
+    meter: &str,
+    note_data: &str,
+    (difficulty_tag, meter_tag): ChartFields,
+) -> io::Result<Option<StepChart>> {
     // Before the difficulty: other games have difficulties of their own
     if !matches!(step_type, "dance-single" | "dance-double") {
         return Ok(None);
     }
-    let Some(difficulty) = parse_difficulty(difficulty_name)? else { return Ok(None) };
+    let Some(difficulty) = parse_difficulty(difficulty_tag, difficulty_name)? else { return Ok(None) };
 
     let chart = match step_type {
         "dance-single" => StepChart::DanceSingle(SingleChart {
             difficulty,
-            rating: parse_number("#NOTES meter", meter)?,
+            rating: parse_number(meter_tag, meter)?,
             measures: parse_measures(note_data)
                 .map_err(|e| invalid(format!("#NOTES ({step_type} {difficulty_name}): {e}")))?,
+            bpms: Vec::new(),
+            stops: Vec::new(),
         }),
         _ => StepChart::DanceDouble(DoubleChart {}),
     };
     Ok(Some(chart))
 }
 
-/// A `#NOTES` difficulty, by its name or one of the old names StepMania still reads, as
-/// StepMania maps them (its "expert" is Challenge, not DDR's Expert). `None` for Edit.
-fn parse_difficulty(name: &str) -> io::Result<Option<ChartDifficulty>> {
+/// A difficulty, by its name or one of the old names StepMania still reads, as StepMania maps
+/// them (its "expert" is Challenge, not DDR's Expert). `None` for Edit.
+fn parse_difficulty(tag: &str, name: &str) -> io::Result<Option<ChartDifficulty>> {
     let difficulty = match name.to_ascii_lowercase().as_str() {
         "beginner" => ChartDifficulty::Beginner,
         "easy" | "basic" | "light" => ChartDifficulty::Easy,
@@ -248,7 +388,7 @@ fn parse_difficulty(name: &str) -> io::Result<Option<ChartDifficulty>> {
         "hard" | "ssr" | "maniac" | "heavy" => ChartDifficulty::Hard,
         "challenge" | "smaniac" | "expert" | "oni" => ChartDifficulty::Challenge,
         "edit" => return Ok(None),
-        _ => return Err(invalid(format!("#NOTES: unknown difficulty {name:?}"))),
+        _ => return Err(invalid(format!("{tag}: unknown difficulty {name:?}"))),
     };
     Ok(Some(difficulty))
 }
@@ -311,6 +451,12 @@ mod tests {
             .collect()
     }
 
+    /// A chart's (BPMs, stops) as (beat, value) pairs.
+    fn timing(chart: &SingleChart) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let bpms = chart.bpms.iter().map(|change| (change.beat, change.bpm)).collect();
+        (bpms, chart.stops.iter().map(|stop| (stop.beat, stop.seconds)).collect())
+    }
+
     /// The chart's notes in .sm notation, with rows separated by spaces and measures by ", ".
     fn notes_text(chart: &SingleChart) -> String {
         let row_text = |row: &[Note; 4]| -> String {
@@ -366,6 +512,9 @@ mod tests {
             [(Beginner, 1.0), (Easy, 3.0), (Medium, 5.0), (Hard, 8.0), (Challenge, 11.0)]
         );
         assert!(singles.iter().flat_map(|c| &c.measures).all(|m| m.num_beats == 4));
+        // An .sm has only the song's timing
+        let song = (vec![(0.0, 120.0), (16.0, 240.0), (32.5, 60.0), (48.0, 120.0)], vec![(8.0, 0.5), (24.25, 0.125)]);
+        assert!(singles.iter().all(|&chart| timing(chart) == song));
 
         // Beginner: taps and jumps.
         assert_eq!(notes_text(singles[0]), "1000 0100 0010 0001, 1001 0110 0000 0000");
@@ -410,6 +559,62 @@ mod tests {
         assert_eq!(loaded.unwrap().title, load("chart_stats.sm").title);
         // No simfile named after that folder
         assert_eq!(without.err().map(|e| e.kind()), Some(ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn loads_an_ssc_with_timing_for_each_chart() {
+        let sim = load("Split Timing");
+        assert_eq!((sim.title.as_str(), sim.artist.as_str(), sim.banner.as_str()), ("Split Timing", "ddr-trainer", "Split Timing.png"));
+        assert_eq!((sim.offset, sim.sample_start, sim.sample_length), (-0.25, 30.0, 12.0));
+
+        // The Edit and pump-single charts are skipped, leaving 3 singles and then a double
+        assert_eq!(sim.step_charts.len(), 4);
+        assert!(matches!(sim.step_charts[3], StepChart::DanceDouble(_)));
+        let singles = singles(&sim);
+        assert_eq!(singles.iter().map(|c| (c.difficulty, c.rating)).collect::<Vec<_>>(), [(Beginner, 1.0), (Easy, 3.0), (Medium, 5.0)]);
+        assert!(singles.iter().flat_map(|c| &c.measures).all(|m| m.num_beats == 4));
+
+        // No timing of its own: the song's
+        assert_eq!(timing(singles[0]), (vec![(0.0, 120.0), (8.0, 240.0)], vec![(4.0, 0.5)]));
+        // BPMs of its own replace all of the song's timing, stops too
+        assert_eq!(timing(singles[1]), (vec![(0.0, 150.0)], vec![]));
+        assert_eq!(timing(singles[2]), (vec![(0.0, 90.0), (6.0, 180.0)], vec![(2.0, 0.25), (6.5, 1.0)]));
+
+        assert_eq!(notes_text(singles[0]), "1000 0100 0010 0001, 1001 0110 0000 0000");
+        assert_eq!(notes_text(singles[1]), "2000 0000 3000 0000, 0110 0000 0000 0000");
+        assert_eq!(notes_text(singles[2]), "4000 0M00 0000 3000, 1000 0100 0010 0001 1001 0000 0000 0000");
+    }
+
+    #[test]
+    fn reads_either_format_whatever_the_file_is_called() {
+        let dir = std::env::temp_dir().join(format!("ddr-trainer-swapped-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources");
+        fs::copy(resources.join("Split Timing/Split Timing.ssc"), dir.join("ssc.sm")).unwrap();
+        fs::copy(resources.join("Feature Test/Feature Test.sm"), dir.join("sm.ssc")).unwrap();
+        let (ssc, sm) = (SimFile::from_file(dir.join("ssc.sm")), SimFile::from_file(dir.join("sm.ssc")));
+        fs::remove_dir_all(&dir).unwrap();
+
+        let charts = |sim: &SimFile| -> Vec<_> {
+            let singles = singles(sim).into_iter().map(|c| (c.difficulty, c.rating, notes_text(c), timing(c)));
+            singles.collect()
+        };
+        assert_eq!(charts(&ssc.unwrap()), charts(&load("Split Timing")));
+        assert_eq!(charts(&sm.unwrap()), charts(&load("Feature Test")));
+    }
+
+    #[test]
+    fn loads_a_song_folders_ssc_over_its_sm() {
+        let folder = std::env::temp_dir().join(format!("ddr-trainer-both-formats-{}", std::process::id())).join("Song");
+        fs::create_dir_all(&folder).unwrap();
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_resources");
+        fs::copy(resources.join("chart_stats.sm"), folder.join("Song.sm")).unwrap();
+        fs::copy(resources.join("Split Timing/Split Timing.ssc"), folder.join("Song.SSC")).unwrap();
+        let loaded = SimFile::from_file(&folder);
+        let listed = simfiles_in(&folder);
+        fs::remove_dir_all(folder.parent().unwrap()).unwrap();
+        assert_eq!(loaded.unwrap().title, "Split Timing");
+        assert_eq!(listed.unwrap(), [folder.join("Song.SSC")]);
     }
 
     #[test]
@@ -508,7 +713,7 @@ mod tests {
 
     #[test]
     fn reads_the_step_type_before_the_difficulty() {
-        let chart = |step_type: &str, difficulty: &str| parse_chart(&format!("{step_type}::{difficulty}:8::1000\n0000\n"));
+        let chart = |step_type: &str, difficulty: &str| parse_sm_chart(&format!("{step_type}::{difficulty}:8::1000\n0000\n"));
         let single = |difficulty: &str| match chart("dance-single", difficulty) {
             Ok(Some(StepChart::DanceSingle(single))) => Some(single.difficulty),
             _ => None,
@@ -575,6 +780,44 @@ mod tests {
             assert!(parse_number("x", not_finite).is_err());
         }
         assert_eq!(parse_number("x", " -1.5e2 ").unwrap(), -150.0);
+    }
+
+    /// An .ssc that loads, with `old` replaced by `new`.
+    fn ssc_changed(old: &str, new: &str) -> io::Result<SimFile> {
+        let valid = "#VERSION:0.83;\n#TITLE:t;\n#BPMS:0=120;\n#STOPS:;\n#WARPS:;\n\
+                     #NOTEDATA:;\n#STEPSTYPE:dance-single;\n#DIFFICULTY:Hard;\n#METER:8;\n\
+                     #BPMS:0=150;\n#STOPS:4=0.5;\n#DELAYS:;\n#NOTES:\n1000\n0000\n;\n";
+        assert!(SimFile::parse(valid).is_ok());
+        assert_eq!(valid.matches(old).count(), 1, "{old:?}");
+        SimFile::parse(&valid.replace(old, new))
+    }
+
+    #[test]
+    fn rejects_invalid_ssc_charts() {
+        let error = |old: &str, new: &str| ssc_changed(old, new).err().map(|e| e.to_string()).unwrap_or_default();
+        // Timing of its own needs BPMs, and is checked like the song's
+        let no_bpms = "#NOTEDATA (dance-single Hard): timing of its own, but no #BPMS";
+        assert!(error("#BPMS:0=150;\n", "").contains(no_bpms));
+        assert!(error("#BPMS:0=150;", "#BPMS:;").contains(no_bpms));
+        assert!(error("#BPMS:0=150;", "#BPMS:0=-150;").contains("a BPM must be above 0, got -150 on beat 0"));
+        assert!(error("#STOPS:4=0.5;", "#STOPS:4=-0.5;").contains("a stop can't be negative"));
+        // Without stops, it has none
+        let sim = ssc_changed("#STOPS:4=0.5;\n", "").unwrap();
+        assert_eq!(timing(singles(&sim)[0]), (vec![(0.0, 150.0)], vec![]));
+
+        // Timing the analyzer can't follow, in the song or a chart
+        let unsupported = "(delays, warps and fakes aren't supported)";
+        assert!(error("#WARPS:;", "#WARPS:4=1;").contains(&format!(r#"#WARPS: "4=1" {unsupported}"#)));
+        assert!(error("#DELAYS:;", "#DELAYS:4=0.5;").contains(&format!(r#"#DELAYS: "4=0.5" {unsupported}"#)));
+        assert!(error("#DELAYS:;", "#FAKES:4=1;").contains(&format!(r#"#FAKES: "4=1" {unsupported}"#)));
+
+        assert!(error("#METER:8;", "#METER:eight;").contains(r#"#METER: expected a number, got "eight""#));
+        assert!(error("#DIFFICULTY:Hard;", "#DIFFICULTY:Impossible;").contains(r#"#DIFFICULTY: unknown difficulty "Impossible""#));
+        assert!(error("1000\n", "1L00\n").contains(r#"#NOTES (dance-single Hard): measure 0: can't read row "1L00""#));
+        // A chart that never gets its #NOTES
+        assert!(error("#NOTES:\n1000\n0000\n;\n", "").contains("the file ends in a chart with no #NOTES"));
+        let next = "#NOTEDATA:;\n#STEPSTYPE:dance-single;\n";
+        assert!(error("#STEPSTYPE:dance-single;\n", next).contains("#NOTEDATA: the chart before it has no #NOTES"));
     }
 
     #[test]

@@ -41,7 +41,9 @@ tools:
   fit-costs <sheet> [songs]    search for the costs closest to the spreadsheet, on three songs in
                                four, and score them on the rest (about 40 minutes for DDR A3)
 
-songs defaults to DDR A3. A simfile is a .sm file or its song folder.";
+songs defaults to the dataset, the packs in data/packs from DDR A to WORLD, and for the cost
+tools to its DDR A3 pack, which the sheet counts. Run from the repo. A simfile is a .sm or .ssc
+file, or its song folder.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
