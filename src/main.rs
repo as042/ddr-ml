@@ -25,6 +25,12 @@ tools:
                                train a rating model on a folder of song folders and save it, with
                                its split, in artifacts/<name>/ (replacing what's there), or by
                                default in a new artifacts/model_<UTC date>_<time>Z/
+  crossval [songs] [--folds <n>] [--name <name>]
+                               cross-validate train's model by song: each fold's charts are
+                               predicted by a model trained without their songs (5 folds by
+                               default), and scored against the official ratings and Sanbai's.
+                               Every prediction is saved in artifacts/<name>/, or by default in
+                               a new artifacts/crossval_<UTC date>_<time>Z/
   pca [songs]                  fit a PCA of the chart statistics and save it
   infer [--model <name>] <simfile>...
                                rate each chart with the model saved in artifacts/<name>/, by
@@ -46,9 +52,9 @@ tools:
   fit-costs <sheet> [songs]    search for the costs closest to the spreadsheet, on three songs in
                                four, and score them on the rest (about 40 minutes for DDR A3)
 
-songs defaults to the dataset, the packs in data/packs from DDR A to WORLD, and for the cost
-tools to its DDR A3 pack, which the sheet counts. Run from the repo. A simfile is a .sm or .ssc
-file, or its song folder.";
+songs defaults to the dataset, the packs in data/packs from 1st Mix to WORLD (before DDR A, only
+songs in today's game at today's ratings), and for the cost tools to its DDR A3 pack, which the
+sheet counts. Run from the repo. A simfile is a .sm or .ssc file, or its song folder.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,6 +75,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     match tool.as_str() {
         "train" => tools::train(args),
+        "crossval" => tools::crossval(args),
         "pca" => tools::pca(args),
         "infer" => tools::infer(args),
         "feet" => tools::feet(args),

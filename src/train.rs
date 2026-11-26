@@ -174,8 +174,11 @@ pub struct TestResults {
     pub predictions: Vec<Vec<f32>>,
 }
 
+/// Dataset rows to (train on, validate on, test on).
+pub type Split = (Vec<usize>, Vec<usize>, Vec<usize>);
+
 /// Seeded random split of `0..num_rows` into (train, validation, test).
-pub fn split_rows(num_rows: usize, config: &TrainingConfig) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+pub fn split_rows(num_rows: usize, config: &TrainingConfig) -> Split {
     let n_train = (num_rows as f64 * config.train_ratio).round() as usize;
     let n_val = (num_rows as f64 * config.valid_ratio).round() as usize;
     assert!(n_train + n_val <= num_rows, "train_ratio + valid_ratio must not exceed 1");
@@ -248,7 +251,7 @@ impl TrainedModel {
     /// Loads a model saved with [`TrainedModel::save`], in validation mode.
     pub fn load(dir: impl AsRef<Path>, device: &Device) -> Result<Self, Box<dyn Error>> {
         let dir = dir.as_ref();
-        let config = ModelConfig::load(dir.join(CONFIG_FILE))?;
+        let config = ModelConfig::read(dir.join(CONFIG_FILE))?;
 
         // Read eagerly: burn's `load_file` reads tensors lazily, so the model would break if
         // the file later changed or was deleted.
@@ -303,23 +306,27 @@ impl TrainedModel {
 
 impl ModelConfig {
     /// Seeds the device with `config.train_seed`, then builds a model and trains it with
-    /// [`Model::fit`].
+    /// [`Model::fit_on`] on `config`'s split.
     ///
     /// With `config.input_pca` on, the model trains on the components and is then converted to
     /// take `dataset`'s inputs, so it matches this config and saves like any other.
     pub fn train(&self, dataset: &Dataset, config: &TrainingConfig) -> (TrainedModel, TestResults) {
+        self.train_on(dataset, config, split_rows(dataset.x.dims()[0], config))
+    }
+
+    /// [`ModelConfig::train`] on a given split, not `config`'s.
+    pub fn train_on(&self, dataset: &Dataset, config: &TrainingConfig, split: Split) -> (TrainedModel, TestResults) {
         let device = dataset.x.device();
         if config.input_pca == InputPca::Off {
             device.seed(config.train_seed);
-            return self.init(&device).fit(dataset, config);
+            return self.init(&device).fit_on(dataset, config, split);
         }
 
         let [num_rows, width] = dataset.x.dims();
         assert_eq!(width, self.layer_sizes()[0], "dataset.x has {width} columns but the config takes {} inputs", self.layer_sizes()[0]);
         let values = dataset.x.clone().into_data().try_to_vec::<f32>().unwrap();
         let rows: Vec<Vec<f32>> = values.chunks(width).map(<[f32]>::to_vec).collect();
-        let (train_rows, _, _) = split_rows(num_rows, config);
-        let train: Vec<Vec<f32>> = train_rows.iter().map(|&row| rows[row].clone()).collect();
+        let train: Vec<Vec<f32>> = split.0.iter().map(|&row| rows[row].clone()).collect();
         let pca = Pca::fit(&vec!["input"; width], &train);
         let num_components = config.input_pca.num_components(&pca);
         say!(
@@ -334,19 +341,26 @@ impl ModelConfig {
         sizes[0] = num_components;
         let reduced = ModelConfig::new(sizes).with_dropout(self.dropout);
         device.seed(config.train_seed);
-        let (trained, test) = reduced.init(&device).fit(&components, &config.clone().with_input_pca(InputPca::Off));
+        let (trained, test) = reduced.init(&device).fit_on(&components, &config.clone().with_input_pca(InputPca::Off), split);
         (trained.with_pca_inputs(&pca, num_components), test)
     }
 }
 
 impl Model {
-    /// Trains a copy of this model from its current weights, leaving `self` unchanged. Returns
-    /// the weights with the best validation loss and their test-split results (also printed).
+    /// [`Model::fit_on`] `config`'s split.
+    #[cfg(test)]
+    pub fn fit(&self, dataset: &Dataset, config: &TrainingConfig) -> (TrainedModel, TestResults) {
+        self.fit_on(dataset, config, split_rows(dataset.x.dims()[0], config))
+    }
+
+    /// Trains a copy of this model from its current weights, leaving `self` unchanged, on
+    /// `split`'s rows. Returns the weights with the best validation loss and their test-split
+    /// results (also printed).
     ///
     /// `dataset` must be on the autodiff device `self` was created on. Scaling uses
     /// training-split statistics only. The validation split drives learning-rate decay and
     /// early stopping.
-    pub fn fit(&self, dataset: &Dataset, config: &TrainingConfig) -> (TrainedModel, TestResults) {
+    pub fn fit_on(&self, dataset: &Dataset, config: &TrainingConfig, split: Split) -> (TrainedModel, TestResults) {
         assert!(
             config.input_pca == InputPca::Off,
             "input_pca needs ModelConfig::train, which sizes the model's inputs to the components"
@@ -367,8 +381,7 @@ impl Model {
             self.num_outputs()
         );
 
-        // Split rows into train/validation/test
-        let (train_rows, val_rows, test_rows) = split_rows(dataset.x.dims()[0], config);
+        let (train_rows, val_rows, test_rows) = split;
         let (n_train, n_val, n_test) = (train_rows.len(), val_rows.len(), test_rows.len());
         assert!(
             n_train >= config.batch_size,
@@ -611,6 +624,22 @@ mod tests {
             assert_eq!(mean.iter().all(|&mean| mean == 0.0), scaling == InputScaling::Unscaled, "{scaling:?}: {mean:?}");
             assert!(to_vec(trained.y_std.val())[0] > 1.0, "targets are always standardized");
         }
+    }
+
+    #[test]
+    fn trains_on_a_given_split() {
+        let device = DevicePreference::default().device();
+        let inputs: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32, (i % 5) as f32]).collect();
+        let targets: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32]).collect();
+        let dataset = Dataset::from_rows(&inputs, &targets, &device);
+        let config = TrainingConfig::new().with_batch_size(8).with_max_epochs(2);
+        // Every 4th row tested, the next validated, in any order
+        let test: Vec<usize> = (0..40).step_by(4).rev().collect();
+        let validation: Vec<usize> = (1..40).step_by(4).collect();
+        let train = (0..40).filter(|row| row % 4 > 1).collect();
+        let (_, results) = ModelConfig::new(vec![2, 4, 1]).train_on(&dataset, &config, (train, validation, test.clone()));
+        assert_eq!(results.rows, test);
+        assert_eq!(results.predictions.len(), test.len());
     }
 
     /// Columns 2 and 3 are combinations of 0 and 1, so there are 2 independent directions.

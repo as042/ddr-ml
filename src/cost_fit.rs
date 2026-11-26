@@ -65,7 +65,7 @@ pub fn counts(notes: &[TimedNote], footing: &Solution) -> Counts {
 
 /// Rows of comma-separated text. A field in double quotes can hold commas, line breaks and `""`
 /// for a quote.
-fn parse_csv(text: &str) -> Vec<Vec<String>> {
+pub(crate) fn parse_csv(text: &str) -> Vec<Vec<String>> {
     let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
     let mut quoted = false;
     let mut chars = text.chars().peekable();
@@ -93,7 +93,7 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
 }
 
 /// Letters and digits only, in lower case: titles differ in spacing and punctuation.
-fn title_key(title: &str) -> String {
+pub(crate) fn title_key(title: &str) -> String {
     title.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 

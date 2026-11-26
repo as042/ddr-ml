@@ -9,10 +9,12 @@ pub struct Model {
     linears: Vec<Linear>,
     activation: Relu,
     dropout: Dropout,
+    /// See `ModelConfig::input_clip`
+    input_clip: f64,
 }
 
 /// A fully connected network, as the width of every layer from the inputs to the outputs. Each
-/// hidden layer is followed by a ReLU, then dropout while training.
+/// hidden layer is followed by a ReLU, then dropout while training. Inputs can be capped first.
 ///
 /// These are all 29 → 32 → 16 → 1:
 /// - `ModelConfig::new(vec![29, 32, 16, 1])`
@@ -25,6 +27,12 @@ pub struct ModelConfig {
     /// Fraction of hidden activations zeroed each training step; none in validation mode
     #[config(default = 0.0)]
     pub dropout: f64,
+    /// Inputs (scaled, as the model gets them) are capped at plus or minus this, in training
+    /// and prediction alike, so a statistic far outside the training range can't swing a
+    /// prediction without bound. 0 for no cap
+    /// (A config saved before this existed has none: see `ModelConfig::read`.)
+    #[config(default = 0.0)]
+    pub input_clip: f64,
 }
 
 impl ModelConfig {
@@ -61,6 +69,16 @@ impl ModelConfig {
         Self::new(std::iter::once(num_inputs).chain(hidden).chain([num_outputs]).collect())
     }
 
+    /// A saved config. burn's `Config::load` needs every field, so one saved before `input_clip`
+    /// existed gets it here, as 0.
+    pub fn read(path: impl AsRef<std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut fields: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        if let Some(fields) = fields.as_object_mut() {
+            fields.entry("input_clip").or_insert(0.0.into());
+        }
+        Ok(serde_json::from_value(fields)?)
+    }
+
     pub fn layer_sizes(&self) -> &[usize] {
         &self.layer_sizes
     }
@@ -74,8 +92,10 @@ impl ModelConfig {
     ///
     /// # Panics
     ///
-    /// If the config has fewer than 2 widths, a width of 0, or `dropout` outside `[0, 1)`.
+    /// If the config has fewer than 2 widths, a width of 0, `dropout` outside `[0, 1)`, or a
+    /// negative `input_clip`.
     pub fn init(&self, device: &Device) -> Model {
+        assert!(self.input_clip >= 0.0, "input_clip must be 0 (none) or more, not {}", self.input_clip);
         assert!(
             self.layer_sizes.len() >= 2 && self.layer_sizes.iter().all(|&size| size > 0),
             "a model needs at least an input and an output width, none of them 0, but got {:?}",
@@ -86,6 +106,7 @@ impl ModelConfig {
             linears,
             activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
+            input_clip: self.input_clip,
         }
     }
 }
@@ -125,7 +146,12 @@ impl Model {
     /// A model that gives `x` what this one gives `x · weights + offsets`, by folding that map
     /// into the first layer. `weights` is `[new_num_inputs, num_inputs]`, `offsets`
     /// `[1, num_inputs]`.
+    ///
+    /// # Panics
+    ///
+    /// If the model caps its inputs: the cap would then apply to the new inputs, not the old.
     pub fn with_input_map(mut self, weights: Tensor<2>, offsets: Tensor<2>) -> Self {
+        assert_eq!(self.input_clip, 0.0, "a model that caps its inputs can't take an input map");
         let weight = self.linears[0].weight.val();
         let [_, width] = weight.dims();
         let shift = offsets.matmul(weight.clone()).reshape([width]);
@@ -141,6 +167,9 @@ impl Model {
     }
 
     pub fn forward<const D: usize>(&self, mut x: Tensor<D>) -> Tensor<D> {
+        if self.input_clip > 0.0 {
+            x = x.clamp(-self.input_clip, self.input_clip);
+        }
         for l in 0..(self.linears.len() - 1) {
             x = self.linears[l].forward(x);
             x = self.activation.forward(x);
@@ -179,6 +208,31 @@ mod tests {
             let expected: Vec<[usize; 2]> = sizes.windows(2).map(|pair| [pair[0], pair[1]]).collect();
             assert_eq!(built, expected, "{config:?}");
         }
+    }
+
+    #[test]
+    fn caps_inputs_when_asked() {
+        let device = DevicePreference::default().device();
+        let inputs = |values: [f32; 2]| Tensor::<2>::from_data(TensorData::new(values.to_vec(), [1, 2]), &device);
+        let output = |model: &Model, values| model.forward(inputs(values)).into_data().try_to_vec::<f32>().unwrap();
+        let config = ModelConfig::new(vec![2, 3, 1]);
+        assert_eq!(config.input_clip, 0.0, "no cap by default");
+        let capped = config.clone().with_input_clip(1.0).init(&device);
+        assert_eq!(output(&capped, [5.0, -7.0]), output(&capped, [1.0, -1.0]));
+        assert_ne!(output(&capped, [0.5, -7.0]), output(&capped, [1.0, -1.0]));
+        let uncapped = config.init(&device);
+        assert_ne!(output(&uncapped, [5.0, -7.0]), output(&uncapped, [1.0, -1.0]));
+        // Configs saved before the cap load without one
+        let path = std::env::temp_dir().join(format!("ddr-trainer-old-config-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"layer_sizes": [335, 2048, 1], "dropout": 0.2}"#).unwrap();
+        let old = ModelConfig::read(&path);
+        let capped = ModelConfig::new(vec![3, 1]).with_input_clip(5.0);
+        capped.save(&path).unwrap();
+        let saved = ModelConfig::read(&path);
+        std::fs::remove_file(&path).unwrap();
+        let old = old.unwrap();
+        assert_eq!((old.layer_sizes(), old.dropout, old.input_clip), (&[335, 2048, 1][..], 0.2, 0.0));
+        assert_eq!(saved.unwrap().input_clip, 5.0);
     }
 
     #[test]

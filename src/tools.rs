@@ -1,6 +1,7 @@
 //! The command-line tools (see `main`). Each is a script over the rest of the crate.
 
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt::Write as _,
     fs,
@@ -22,13 +23,13 @@ use crate::chart_analyzer::{
 use crate::chart_analyzer::{Cost, analyze_single_chart};
 use crate::cma_es;
 use crate::cost_fit::{self, COLUMNS, SCORED, Sheet};
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, scramble, shuffle};
 use crate::device::DevicePreference;
 use crate::model::ModelConfig;
 use crate::pca::Pca;
 use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart, simfiles_in};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
-use crate::train::{self, TrainedModel, TrainingConfig};
+use crate::train::{self, Split, TrainedModel, TrainingConfig};
 
 const CACHE_FILE: &str = "artifacts/stats_cache.json";
 /// Saved models are folders in here.
@@ -42,12 +43,52 @@ const SPLIT_FILE: &str = "split.json";
 const PCA_FILE: &str = "artifacts/pca.json";
 /// Untracked (copyrighted), see data/.gitignore.
 const PACKS_DIR: &str = "data/packs";
-/// Default training data, oldest first. Checked 2026-11-25: no song in two packs.
-const DATASET: [&str; 5] = ["DDR A (AC INTL)", "DDR A20 (AC INTL)", "DDR A20 PLUS (AC INTL)", "DDR A3 (AC INTL)", "DDR WORLD (AC INTL)"];
+/// Default training data, oldest first (see `current_charts`). The older packs are steps only,
+/// with their song folders one folder deeper (`song_root`).
+const DATASET: [(&str, Songs); 22] = [
+    ("DDR (AC JP) (steps)", Songs::Current), // 1st Mix
+    ("DDR 2ndMIX (AC JP) (steps)", Songs::Current),
+    ("DDR 2ndMIX LINK v(AC JP) (steps)", Songs::Current),
+    ("DDR 3rdMIX (AC JP) (steps)", Songs::Current),
+    ("DDR 3rdMIX PLUS (AC JP) (steps)", Songs::Current),
+    ("DDR 4thMIX (AC JP) (steps)", Songs::Current),
+    ("DDR 5thMIX (AC JP) (steps)", Songs::Current),
+    ("DDR MAX 6thMIX (AC JP) (steps)", Songs::Current),
+    ("DDR MAX2 7thMIX (AC JP) (steps)", Songs::Current),
+    ("DDR EXTREME (AC JP) (steps)", Songs::Current),
+    ("DDR SuperNOVA (AC INTL) (steps)", Songs::Current),
+    ("DDR SuperNOVA2 (AC JP) (steps)", Songs::Current),
+    ("DDR X (AC JP) (steps)", Songs::Current),
+    ("DDR X2 (AC JP) (steps)", Songs::Current),
+    ("DDR X3 VS 2ndMIX (AC JP) (steps)", Songs::Current),
+    ("DDR 2013 (AC JP) (steps)", Songs::Current),
+    ("DDR 2014 (AC JP) (steps)", Songs::Current),
+    ("DDR A (AC INTL)", Songs::All),
+    ("DDR A20 (AC INTL)", Songs::All),
+    ("DDR A20 PLUS (AC INTL)", Songs::All),
+    ("DDR A3 (AC INTL)", Songs::All),
+    ("DDR WORLD (AC INTL)", Songs::All),
+];
+/// One song in today's game, but several in the older packs (4 types of Tohoku EVOLVED in X3,
+/// 2 sides of SUNKiSS♥DROP in SuperNOVA2), and which is today's can't be told: left out.
+const EXCLUDED_SONGS: [&str; 2] = ["Tohoku EVOLVED", "SUNKiSS♥DROP"];
 /// The pack the chart spreadsheet counts.
 const SHEET_PACK: &str = "DDR A3 (AC INTL)";
-/// The first seed that puts all 5 [ ]DENTITY charts in the test split, on `DATASET`. (643 did
-/// it for the 4 on DDR A3 alone.)
+/// Sanbai's ratings of the current game's charts (see `Sanbai`).
+const SANBAI_FILE: &str = "data/sanbai/sanbai_sp_all.csv";
+/// `crossval`'s, when it isn't given `--folds`.
+const DEFAULT_FOLDS: usize = 5;
+/// In `crossval`'s folder: every chart's out-of-fold prediction.
+const PREDICTIONS_FILE: &str = "predictions.csv";
+/// `crossval` prints every 10th epoch of each fold.
+const CROSSVAL_LOG_INTERVAL: usize = 10;
+/// `train`'s (see `model_setup`).
+const WEIGHT_DECAY: f32 = 1.0;
+const INPUT_NOISE: f64 = 0.2;
+/// Standard deviations (see `ModelConfig::input_clip`)
+const INPUT_CLIP: f64 = 10.0;
+/// The first seed that put all 5 [ ]DENTITY charts in the test split on the five A-era packs
+/// alone (643 did it for the 4 on DDR A3 alone). `DATASET` has more now.
 const SPLIT_SEED: u64 = 37565;
 /// Test-set predictions to print at the end.
 const EXAMPLES: usize = 12;
@@ -55,10 +96,29 @@ const EXAMPLES: usize = 12;
 const LEVEL_MIDDLE: f32 = 0.5;
 const SCALE_NOTE: &str = "predicted: 14.00 is the easiest 14, 14.50 a typical 14";
 
+/// Which of a pack's songs are training data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Songs {
+    /// All: the A-era packs, rated on today's scale when they came out
+    All,
+    /// Only songs in today's game at today's ratings (`current_charts`): the older packs, whose
+    /// other songs' ratings can't be checked
+    Current,
+}
+
+/// A folder of song folders, and which of its songs are training data.
+struct Pack {
+    folder: PathBuf,
+    songs: Songs,
+}
+
 struct Sample {
     name: String,
     /// The file the chart is in
     simfile: PathBuf,
+    /// Its pack's place in the packs it was loaded from
+    pack: usize,
+    difficulty: ChartDifficulty,
     features: Vec<f32>,
     rating: f32,
 }
@@ -168,7 +228,7 @@ impl<'a> SplitRecord<'a> {
 
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
 /// chart in a folder of song folders (the argument, or the `DATASET` packs), and saves it to
-/// `--name`'s folder in `ARTIFACTS`, or a new `new_model_dir`, with its split (`SPLIT_FILE`).
+/// `--name`'s folder in `ARTIFACTS`, or a new `new_run_dir`, with its split (`SPLIT_FILE`).
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (name, songs) = take_option(args, "--name")?;
     // Before training, which takes minutes
@@ -179,24 +239,13 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
     let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
     let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
-    let model_config = ModelConfig::funnel(inputs[0].len(), 1, 2048, 1).with_dropout(0.2);
-    let weight_decay = 1.0;
-    let input_noise = 0.2;
-    let training = TrainingConfig::new()
-        .with_batch_size(32)
-        .with_input_noise(input_noise)
-        .with_split_seed(SPLIT_SEED)
-        .with_optimizer(AdamWConfig::new().with_weight_decay(weight_decay));
+    let (model_config, training) = model_setup(inputs[0].len());
     enough_charts(samples.len(), &training, training.batch_size)?;
-    say!(
-        "model: {} (inputs, hidden layers, output), dropout {}, weight decay {weight_decay}, input noise {input_noise}",
-        model_config.shape(),
-        model_config.dropout
-    );
+    say!("{}", describe_model(&model_config));
     let (trained, test) = model_config.train(&dataset, &training);
     let dir = match named_dir {
         Some(dir) => dir,
-        None => new_model_dir(Path::new(ARTIFACTS), SystemTime::now())?,
+        None => new_run_dir(Path::new(ARTIFACTS), "model", SystemTime::now())?,
     };
     trained.save(&model_config, &dir)?;
     ModelInputs::now(feature_names).save(&dir)?;
@@ -220,6 +269,361 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
         accuracy.max_error
     );
     Ok(())
+}
+
+/// `train`'s model and training settings, which `crossval` uses too.
+fn model_setup(num_inputs: usize) -> (ModelConfig, TrainingConfig) {
+    let model_config = ModelConfig::funnel(num_inputs, 1, 2048, 1).with_dropout(0.2).with_input_clip(INPUT_CLIP);
+    let training = TrainingConfig::new()
+        .with_batch_size(32)
+        .with_input_noise(INPUT_NOISE)
+        .with_split_seed(SPLIT_SEED)
+        .with_optimizer(AdamWConfig::new().with_weight_decay(WEIGHT_DECAY));
+    (model_config, training)
+}
+
+fn describe_model(model_config: &ModelConfig) -> String {
+    format!(
+        "model: {} (inputs, hidden layers, output), dropout {}, weight decay {WEIGHT_DECAY}, input noise {INPUT_NOISE}, inputs capped at {} sd",
+        model_config.shape(),
+        model_config.dropout,
+        model_config.input_clip
+    )
+}
+
+/// Cross-validates `train`'s model on a folder of song folders (the argument, or the `DATASET`
+/// packs). The songs are dealt into `--folds` folds (`DEFAULT_FOLDS`), and each fold's charts are
+/// predicted by a model trained without its songs (`fold_split`). Prints how far the predictions
+/// are from the official ratings, and from Sanbai's (`SANBAI_FILE`) where it has the chart, and
+/// saves them all (`PREDICTIONS_FILE`) in `--name`'s folder in `ARTIFACTS`, or a new one.
+pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let ([folds, name], songs) = take_options(args, ["--folds", "--name"])?;
+    let folds = match folds {
+        None => DEFAULT_FOLDS,
+        Some(folds) => {
+            let parsed = folds.parse().ok().filter(|&folds: &usize| folds >= 2);
+            parsed.ok_or_else(|| format!("--folds takes a whole number, 2 or more, not {folds}"))?
+        }
+    };
+    // Before training, which takes minutes
+    let named_dir = name.map(|name| model_dir(&name)).transpose()?;
+    let (_, samples) = cached_samples(&song_packs(&songs)?)?;
+    let (song_of, num_songs) = song_ids(&samples);
+    if num_songs < folds {
+        return Err(format!("{num_songs} songs are too few for {folds} folds").into());
+    }
+
+    let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
+    let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
+    let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
+    let (model_config, training) = model_setup(inputs[0].len());
+    let training = training.with_log_interval(CROSSVAL_LOG_INTERVAL);
+    let fold_of_song = song_folds(num_songs, folds, training.split_seed);
+    say!("{}", describe_model(&model_config));
+    say!("{num_songs} songs (a cover counts as the song it covers) in {folds} folds, split seed {}", training.split_seed);
+
+    let mut predicted = vec![f64::NAN; samples.len()];
+    for fold in 0..folds {
+        let split = fold_split(&song_of, &fold_of_song, fold, training.valid_ratio, training.split_seed);
+        if split.0.len() < training.batch_size || split.1.is_empty() || split.2.is_empty() {
+            return Err(format!("fold {} is too small to train, validate and test on", fold + 1).into());
+        }
+        let test_songs = fold_of_song.iter().filter(|&&of| of == fold).count();
+        say!("\n== fold {} of {folds}: {test_songs} songs held out", fold + 1);
+        let (_, test) = model_config.train_on(&dataset, &training, split);
+        for (&row, prediction) in test.rows.iter().zip(&test.predictions) {
+            predicted[row] = prediction[0] as f64;
+        }
+    }
+    let middle = |row: usize| (samples[row].rating + LEVEL_MIDDLE) as f64;
+    let errors: Vec<f64> = (0..samples.len()).map(|row| predicted[row] - middle(row)).collect();
+
+    let rms = |errors: &[f64]| (errors.iter().map(|e| e * e).sum::<f64>() / errors.len() as f64).sqrt();
+    say!(
+        "\n{SCALE_NOTE}\nout of fold, all {} charts: typically {:.3} levels from the middle of their rating (RMS), at most {:.2}",
+        samples.len(),
+        rms(&errors),
+        errors.iter().fold(0.0, |most: f64, e| most.max(e.abs()))
+    );
+    say!("{:<8} {:>6} {:>7} {:>9}", "levels", "charts", "RMS", "mean err");
+    for (label, levels) in [("1-4", 1.0..=4.0), ("5-8", 5.0..=8.0), ("9-11", 9.0..=11.0), ("12-14", 12.0..=14.0), ("15+", 15.0..=f32::MAX)] {
+        let band: Vec<f64> = (0..samples.len()).filter(|&row| levels.contains(&samples[row].rating)).map(|row| errors[row]).collect();
+        if !band.is_empty() {
+            say!("{label:<8} {:>6} {:>7.3} {:>+9.3}", band.len(), rms(&band), band.iter().sum::<f64>() / band.len() as f64);
+        }
+    }
+
+    let sanbai_of = sanbai_ratings(&samples)?;
+    if let Some(sanbai_of) = &sanbai_of {
+        let matched: Vec<usize> = (0..samples.len()).filter(|&row| sanbai_of[row].is_some()).collect();
+        let tier = |row: usize| sanbai_of[row].unwrap_or(0.0) - samples[row].rating as f64;
+        let mean_tier = matched.iter().map(|&row| tier(row)).sum::<f64>() / matched.len().max(1) as f64;
+        // Sanbai moved so its mean tier is the middle of a level, like the model's scale
+        let shifted = |row: usize| sanbai_of[row].unwrap_or(0.0) - mean_tier + LEVEL_MIDDLE as f64;
+        let to_sanbai: Vec<f64> = matched.iter().map(|&row| predicted[row] - shifted(row)).collect();
+        let official: Vec<f64> = matched.iter().map(|&row| middle(row) - shifted(row)).collect();
+        let points: Vec<(f32, f64, f64)> = matched.iter().map(|&row| (samples[row].rating, errors[row], tier(row))).collect();
+        say!(
+            "\nSanbai ({SANBAI_FILE}): {} charts at their official level, mean tier {mean_tier:.3}\n\
+             within-level agreement (r): {:+.3}\n\
+             RMS from Sanbai moved to the model's scale: {:.3} (the official middle: {:.3})",
+            matched.len(),
+            within_level_r(&points).unwrap_or(f64::NAN),
+            rms(&to_sanbai),
+            rms(&official)
+        );
+    }
+
+    let dir = match named_dir {
+        Some(dir) => dir,
+        None => new_run_dir(Path::new(ARTIFACTS), "crossval", SystemTime::now())?,
+    };
+    fs::create_dir_all(&dir)?;
+    let mut csv = String::from("chart,simfile,fold,rating,predicted,sanbai\n");
+    for (row, sample) in samples.iter().enumerate() {
+        let sanbai = sanbai_of.as_ref().and_then(|of| of[row]).map_or(String::new(), |rating| rating.to_string());
+        let simfile = sample.simfile.display().to_string();
+        let fields = [csv_field(&sample.name), csv_field(&simfile)];
+        let _ = writeln!(csv, "{},{},{},{},{:.4},{sanbai}", fields[0], fields[1], fold_of_song[song_of[row]] + 1, sample.rating, predicted[row]);
+    }
+    fs::write(dir.join(PREDICTIONS_FILE), csv)?;
+    say!("\nsaved every chart's out-of-fold prediction to {}", dir.join(PREDICTIONS_FILE).display());
+    Ok(())
+}
+
+/// Each sample's song, numbered from 0 in order of appearance, and how many songs. A song is
+/// its folder, and a cover (`<song> (cover)`) counts as the song it covers: same tempo and
+/// length.
+fn song_ids(samples: &[Sample]) -> (Vec<usize>, usize) {
+    let mut ids = HashMap::new();
+    let song_of = samples
+        .iter()
+        .map(|sample| {
+            let folder = sample.simfile.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy();
+            let song = folder.strip_suffix(" (cover)").unwrap_or(&folder).to_string();
+            let next = ids.len();
+            *ids.entry(song).or_insert(next)
+        })
+        .collect();
+    (song_of, ids.len())
+}
+
+/// Each song's fold: the songs shuffled by `seed`, then dealt out in turn, so folds differ by a
+/// song at most.
+fn song_folds(num_songs: usize, folds: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..num_songs).collect();
+    shuffle(&mut order, seed);
+    let mut fold_of = vec![0; num_songs];
+    for (dealt, &song) in order.iter().enumerate() {
+        fold_of[song] = dealt % folds;
+    }
+    fold_of
+}
+
+/// The rows of fold `fold`'s songs to test on; of the other songs, `valid_ratio` of all songs
+/// to validate on (shuffled by `seed` and the fold), and the rest to train on.
+fn fold_split(song_of: &[usize], fold_of_song: &[usize], fold: usize, valid_ratio: f64, seed: u64) -> Split {
+    let num_songs = fold_of_song.len();
+    let mut others: Vec<usize> = (0..num_songs).filter(|&song| fold_of_song[song] != fold).collect();
+    shuffle(&mut others, scramble(seed).wrapping_add(fold as u64));
+    let validating: HashSet<usize> = others.iter().take((num_songs as f64 * valid_ratio).round() as usize).copied().collect();
+    let (mut train, mut validation, mut test) = (Vec::new(), Vec::new(), Vec::new());
+    for (row, &song) in song_of.iter().enumerate() {
+        match (fold_of_song[song] == fold, validating.contains(&song)) {
+            (true, _) => test.push(row),
+            (false, true) => validation.push(row),
+            (false, false) => train.push(row),
+        }
+    }
+    (train, validation, test)
+}
+
+/// Sanbai's ratings of the current game's charts (3icecream.com: the official level plus a tier
+/// from 0 to 0.95, from players' scores), by song title and difficulty.
+struct Sanbai {
+    /// `cost_fit::title_key` of each title (Japanese and romanized) to its songs
+    songs: HashMap<String, HashSet<String>>,
+    /// (song, difficulty) to (level, rating)
+    charts: HashMap<(String, String), (f64, f64)>,
+}
+
+impl Sanbai {
+    /// Columns song_id, song_name, romanized_name, difficulty, level and sanbai (others ignored).
+    fn parse(text: &str) -> Result<Sanbai, String> {
+        let rows = cost_fit::parse_csv(text);
+        let header = rows.first().ok_or("the Sanbai file is empty")?;
+        let column = |name: &str| header.iter().position(|title| title == name).ok_or_else(|| format!("the Sanbai file has no {name} column"));
+        let [id, name, romanized, difficulty, level, rating] =
+            ["song_id", "song_name", "romanized_name", "difficulty", "level", "sanbai"].map(column);
+        let (id, name, romanized, difficulty, level, rating) = (id?, name?, romanized?, difficulty?, level?, rating?);
+        let mut sanbai = Sanbai { songs: HashMap::new(), charts: HashMap::new() };
+        for row in rows.iter().skip(1).filter(|row| row.len() == header.len()) {
+            for title in [&row[name], &row[romanized]].into_iter().filter(|title| !title.is_empty()) {
+                sanbai.songs.entry(cost_fit::title_key(title)).or_default().insert(row[id].clone());
+            }
+            if let (Ok(level), Ok(rating)) = (row[level].parse(), row[rating].parse()) {
+                sanbai.charts.insert((row[id].clone(), row[difficulty].clone()), (level, rating));
+            }
+        }
+        Ok(sanbai)
+    }
+
+    /// The one Sanbai song that has one of `titles`, if just one does.
+    fn song(&self, titles: &[&str]) -> Option<&String> {
+        let songs: HashSet<&String> = titles.iter().filter_map(|title| self.songs.get(&cost_fit::title_key(title))).flatten().collect();
+        let [song] = songs.into_iter().collect::<Vec<_>>()[..] else { return None };
+        Some(song)
+    }
+
+    /// (level, rating) of `song`'s chart of `difficulty`, if today's game has it.
+    fn chart(&self, song: &str, difficulty: ChartDifficulty) -> Option<(f64, f64)> {
+        self.charts.get(&(song.to_string(), format!("{difficulty:?}"))).copied()
+    }
+
+    /// The rating of the chart of `difficulty` in the one Sanbai song that has one of `titles`,
+    /// if its level is `level`.
+    fn rating(&self, titles: &[&str], difficulty: ChartDifficulty, level: f64) -> Option<f64> {
+        let (sanbai_level, rating) = self.chart(self.song(titles)?, difficulty)?;
+        (sanbai_level == level).then_some(rating)
+    }
+}
+
+/// Each sample's Sanbai rating, matched by its folder's name and its simfile's title, or `None`
+/// for all if there's no `SANBAI_FILE`.
+fn sanbai_ratings(samples: &[Sample]) -> Result<Option<Vec<Option<f64>>>, Box<dyn Error>> {
+    let Ok(text) = fs::read_to_string(SANBAI_FILE) else { return Ok(None) };
+    let sanbai = Sanbai::parse(&text)?;
+    let titles = simfile_titles(samples)?;
+    let ratings = samples.iter().map(|sample| {
+        let folder = folder_name(&sample.simfile);
+        sanbai.rating(&[&folder, &titles[&sample.simfile]], sample.difficulty, sample.rating as f64)
+    });
+    Ok(Some(ratings.collect()))
+}
+
+/// Each simfile's `#TITLE`.
+fn simfile_titles(samples: &[Sample]) -> Result<HashMap<PathBuf, String>, Box<dyn Error>> {
+    let mut titles = HashMap::new();
+    for sample in samples {
+        if !titles.contains_key(&sample.simfile) {
+            let title = SimFile::from_file(&sample.simfile).map_err(|e| format!("{}: {e}", sample.simfile.display()))?.title;
+            titles.insert(sample.simfile.clone(), title);
+        }
+    }
+    Ok(titles)
+}
+
+/// The name of the folder `simfile` is in: its song's.
+fn folder_name(simfile: &Path) -> String {
+    simfile.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy().into_owned()
+}
+
+/// Why a song from a `Songs::Current` pack isn't trained on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LeftOut {
+    /// A language version (a folder ending ` (Chinese)`)
+    Variant,
+    /// Not one song of today's game, by its folder's name or its title
+    NotInGame,
+    /// One of `EXCLUDED_SONGS`
+    Excluded,
+    /// A chart rated otherwise than today: another song of the same name, or an older version
+    RatedOtherwise,
+    /// A newer pack has it
+    OlderCopy,
+}
+
+/// `samples` without what isn't trained on, from packs of `Songs::Current` (`songs`, by
+/// `Sample::pack`; `titles` by simfile): songs not in today's game or rated otherwise (see
+/// `LeftOut`), charts today's game doesn't have, and any copy of a song a newer pack has. Also
+/// how many songs were left out for each reason, and how many more charts.
+fn current_charts(
+    samples: Vec<Sample>,
+    songs: &[Songs],
+    titles: &HashMap<PathBuf, String>,
+    sanbai: &Sanbai,
+) -> (Vec<Sample>, BTreeMap<LeftOut, usize>, usize) {
+    let excluded: HashSet<&String> = EXCLUDED_SONGS.iter().filter_map(|title| sanbai.song(&[title])).collect();
+    // Each song copy (a simfile, its charts in a row): its pack, Sanbai song, and why it's left out
+    let mut copies: Vec<(&Path, usize, Option<&String>, Option<LeftOut>)> = Vec::new();
+    for sample in &samples {
+        if copies.last().is_some_and(|copy| copy.0 == sample.simfile) {
+            continue;
+        }
+        let folder = folder_name(&sample.simfile);
+        let song = sanbai.song(&[&folder, &titles[&sample.simfile]]);
+        let charts = samples.iter().filter(|other| other.simfile == sample.simfile);
+        let mut rated = charts.filter_map(|chart| Some((sanbai.chart(song?, chart.difficulty)?.0, chart.rating as f64)));
+        let left_out = match (songs[sample.pack], song) {
+            (Songs::All, _) => None,
+            _ if folder.ends_with(" (Chinese)") => Some(LeftOut::Variant),
+            (_, None) => Some(LeftOut::NotInGame),
+            (_, Some(song)) if excluded.contains(song) => Some(LeftOut::Excluded),
+            _ if rated.any(|(today, rating)| today != rating) => Some(LeftOut::RatedOtherwise),
+            _ => None,
+        };
+        copies.push((&sample.simfile, sample.pack, song, left_out));
+    }
+    // The newest pack's copy of each song, the first if a pack has two
+    let mut newest: HashMap<&String, (usize, &Path)> = HashMap::new();
+    for &(simfile, pack, song, left_out) in &copies {
+        if let (Some(song), None) = (song, left_out)
+            && newest.get(song).is_none_or(|&(kept, _)| pack > kept)
+        {
+            newest.insert(song, (pack, simfile));
+        }
+    }
+    let mut verdicts: HashMap<&Path, (Option<&String>, Option<LeftOut>)> = HashMap::new();
+    let mut left_out = BTreeMap::new();
+    for &(simfile, pack, song, reason) in &copies {
+        let older = songs[pack] == Songs::Current && reason.is_none() && song.is_some_and(|song| newest[song].1 != simfile);
+        let reason = reason.or(older.then_some(LeftOut::OlderCopy));
+        if let Some(reason) = reason {
+            *left_out.entry(reason).or_insert(0) += 1;
+        }
+        verdicts.insert(simfile, (song, reason));
+    }
+    // Charts of kept songs that today's game doesn't have
+    let verdicts: HashMap<PathBuf, (Option<String>, Option<LeftOut>)> =
+        verdicts.into_iter().map(|(simfile, (song, reason))| (simfile.to_path_buf(), (song.cloned(), reason))).collect();
+    let (mut kept, mut missing_charts) = (Vec::new(), 0);
+    for sample in samples {
+        let (song, reason) = &verdicts[&sample.simfile];
+        let in_game = || song.as_ref().and_then(|song| sanbai.chart(song, sample.difficulty)).is_some();
+        match (reason, songs[sample.pack]) {
+            (Some(_), _) => {}
+            (None, Songs::Current) if !in_game() => missing_charts += 1,
+            (None, _) => kept.push(sample),
+        }
+    }
+    (kept, left_out, missing_charts)
+}
+
+/// Correlation between the model's and Sanbai's verdicts within a level: each (official level,
+/// prediction's distance from the level's middle, Sanbai's tier), both taken relative to their
+/// level's mean. `None` with no spread.
+fn within_level_r(points: &[(f32, f64, f64)]) -> Option<f64> {
+    let mut by_level: HashMap<u32, Vec<(f64, f64)>> = HashMap::new();
+    for &(level, model, sanbai) in points {
+        by_level.entry(level.to_bits()).or_default().push((model, sanbai));
+    }
+    let (mut xy, mut xx, mut yy) = (0.0, 0.0, 0.0);
+    for pairs in by_level.values() {
+        let n = pairs.len() as f64;
+        let (mx, my) = (pairs.iter().map(|p| p.0).sum::<f64>() / n, pairs.iter().map(|p| p.1).sum::<f64>() / n);
+        for &(x, y) in pairs {
+            (xy, xx, yy) = (xy + (x - mx) * (y - my), xx + (x - mx).powi(2), yy + (y - my).powi(2));
+        }
+    }
+    (xx > 0.0 && yy > 0.0).then(|| xy / (xx * yy).sqrt())
+}
+
+/// `text` as one CSV field: in quotes if it has a comma, quote or line break.
+fn csv_field(text: &str) -> String {
+    match text.contains([',', '"', '\n', '\r']) {
+        true => format!("\"{}\"", text.replace('"', "\"\"")),
+        false => text.to_string(),
+    }
 }
 
 /// Fits a PCA of the chart statistics of a folder of song folders (the argument, or the
@@ -283,23 +687,32 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// `--option value` or `--option=value`, at most once, and the other arguments in order. Any
 /// other `--` argument is an error.
 fn take_option(args: &[String], option: &str) -> Result<(Option<String>, Vec<String>), String> {
-    let (mut value, mut rest) = (None, Vec::new());
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let given = match arg.strip_prefix(option) {
-            Some("") => args.next().ok_or_else(|| format!("{option} needs a value"))?,
-            Some(after) if after.starts_with('=') => &after[1..],
-            _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
-            _ => {
-                rest.push(arg.clone());
-                continue;
-            }
-        };
-        if value.replace(given.to_string()).is_some() {
-            return Err(format!("{option} is given twice"));
-        }
-    }
+    let ([value], rest) = take_options(args, [option])?;
     Ok((value, rest))
+}
+
+/// `take_option` for each of `options`.
+fn take_options<const N: usize>(args: &[String], options: [&str; N]) -> Result<([Option<String>; N], Vec<String>), String> {
+    let (mut values, mut rest) = (std::array::from_fn(|_| None), Vec::new());
+    let mut args = args.iter();
+    'args: while let Some(arg) = args.next() {
+        for (value, option) in values.iter_mut().zip(options) {
+            let given = match arg.strip_prefix(option) {
+                Some("") => args.next().ok_or_else(|| format!("{option} needs a value"))?,
+                Some(after) if after.starts_with('=') => &after[1..],
+                _ => continue,
+            };
+            if value.replace(given.to_string()).is_some() {
+                return Err(format!("{option} is given twice"));
+            }
+            continue 'args;
+        }
+        if arg.starts_with("--") {
+            return Err(format!("unknown option {arg}"));
+        }
+        rest.push(arg.clone());
+    }
+    Ok((values, rest))
 }
 
 /// A model's folder in `ARTIFACTS`. The name is one folder name, so the model stays in there.
@@ -310,14 +723,14 @@ fn model_dir(name: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// A new folder in `root` named after `time` (`model_20261126_013015Z`, UTC), with `_2`, `_3`
-/// and so on if a run saved in the same second.
-fn new_model_dir(root: &Path, time: SystemTime) -> io::Result<PathBuf> {
+/// A new folder in `root` named `kind` and `time` (`model_20261126_013015Z`, UTC), with `_2`,
+/// `_3` and so on if a run saved in the same second.
+fn new_run_dir(root: &Path, kind: &str, time: SystemTime) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let stamp = utc_stamp(time);
     let mut copy = 1;
     loop {
-        let name = if copy == 1 { format!("model_{stamp}") } else { format!("model_{stamp}_{copy}") };
+        let name = if copy == 1 { format!("{kind}_{stamp}") } else { format!("{kind}_{stamp}_{copy}") };
         let dir = root.join(name);
         // Fails if it's there, so two runs can't take the same folder
         match fs::create_dir(&dir) {
@@ -1202,28 +1615,58 @@ fn footing_table(segment: &FootedSegment, by_measure: bool) -> String {
 }
 
 /// The folders of song folders a tool reads: the one it was given, or the `DATASET` packs.
-fn song_packs(args: &[String]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn song_packs(args: &[String]) -> Result<Vec<Pack>, Box<dyn Error>> {
     match args {
-        [] => DATASET.iter().map(|pack| pack_folder(pack)).collect(),
-        [songs] => Ok(vec![PathBuf::from(songs)]),
+        [] => DATASET.iter().map(|&(pack, songs)| Ok(Pack { folder: pack_folder(pack)?, songs })).collect(),
+        [songs] => Ok(vec![Pack { folder: song_root(PathBuf::from(songs))?, songs: Songs::All }]),
         _ => Err("expected one folder of song folders at most".into()),
     }
 }
 
-/// A pack's folder in `PACKS_DIR`, if it's there.
+/// A pack's folder of song folders in `PACKS_DIR` (`song_root`), if it's there.
 fn pack_folder(pack: &str) -> Result<PathBuf, Box<dyn Error>> {
     let folder = Path::new(PACKS_DIR).join(pack);
     match folder.is_dir() {
-        true => Ok(folder),
+        true => Ok(song_root(folder)?),
         false => Err(format!("{} not found (run from the repo, with the dataset's packs in {PACKS_DIR})", folder.display()).into()),
     }
 }
 
-/// `load_samples` through the statistics cache in `CACHE_FILE`, which it updates.
-fn cached_samples(packs: &[PathBuf]) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
+/// `folder`, or the one folder in it if that's all it holds and it isn't a song's: steps-only
+/// packs keep their song folders one folder deeper.
+fn song_root(folder: PathBuf) -> io::Result<PathBuf> {
+    let folders: Vec<PathBuf> = sorted_paths(&folder)?.into_iter().filter(|path| path.is_dir()).collect();
+    match &folders[..] {
+        [only] if simfiles_in(only)?.is_empty() => Ok(only.clone()),
+        _ => Ok(folder),
+    }
+}
+
+/// `load_samples` through the statistics cache in `CACHE_FILE`, which it updates, then
+/// `current_charts` if a pack takes only those.
+fn cached_samples(packs: &[Pack]) -> Result<(Vec<String>, Vec<Sample>), Box<dyn Error>> {
     let mut cache = StatsCache::load(CACHE_FILE)?;
-    let (feature_names, samples) = load_samples(packs, &mut cache)?;
-    let songs = packs.iter().map(|pack| pack.display().to_string()).collect::<Vec<_>>().join(", ");
+    let folders: Vec<PathBuf> = packs.iter().map(|pack| pack.folder.clone()).collect();
+    let (feature_names, mut samples) = load_samples(&folders, &mut cache)?;
+    let songs = match &folders[..] {
+        [folder] => folder.display().to_string(),
+        _ => format!("{} packs in {PACKS_DIR}", folders.len()),
+    };
+    if packs.iter().any(|pack| pack.songs == Songs::Current) {
+        let text = fs::read_to_string(SANBAI_FILE).map_err(|e| format!("{SANBAI_FILE}, which picks the older packs' songs: {e}"))?;
+        let sanbai = Sanbai::parse(&text)?;
+        let titles = simfile_titles(&samples)?;
+        let kinds: Vec<Songs> = packs.iter().map(|pack| pack.songs).collect();
+        let before = samples.len();
+        let (kept, left_out, missing_charts) = current_charts(samples, &kinds, &titles, &sanbai);
+        samples = kept;
+        let reasons: Vec<String> = left_out.iter().map(|(reason, songs)| format!("{songs} {reason:?}")).collect();
+        say!(
+            "older packs: {} of {before} charts left out, of songs not trained on ({}), and {missing_charts} charts today's game doesn't have",
+            before - samples.len(),
+            reasons.join(", ")
+        );
+    }
     if samples.is_empty() {
         return Err(format!("no dance-single charts found in {songs}").into());
     }
@@ -1260,7 +1703,8 @@ fn load_samples(packs: &[PathBuf], cache: &mut StatsCache) -> Result<(Vec<String
     let mut feature_names = Vec::new();
     let mut samples = Vec::new();
     let songs = packs.iter().map(|pack| song_folders(pack)).collect::<io::Result<Vec<_>>>()?;
-    for song in songs.into_iter().flatten() {
+    let songs = songs.into_iter().enumerate().flat_map(|(pack, songs)| songs.into_iter().map(move |song| (pack, song)));
+    for (pack, song) in songs {
         let song_name = song.name;
         for file in song.simfiles {
             let charts = match cache.analyze_file(&file) {
@@ -1275,7 +1719,8 @@ fn load_samples(packs: &[PathBuf], cache: &mut StatsCache) -> Result<(Vec<String
                 feature_names = chart.stats.features().into_iter().map(|(feature, _)| feature).collect();
                 match finite_features(&chart.stats) {
                     Ok(features) => {
-                        samples.push(Sample { name, simfile: file.clone(), features, rating: chart.rating as f32 })
+                        let (simfile, difficulty) = (file.clone(), chart.difficulty);
+                        samples.push(Sample { name, simfile, pack, difficulty, features, rating: chart.rating as f32 })
                     }
                     Err(feature) => eprintln!("skipping {name}: its {feature} isn't a finite number"),
                 }
@@ -1375,6 +1820,8 @@ mod tests {
             .map(|i| Sample {
                 name: format!("Song {} [Hard]", i),
                 simfile: PathBuf::from(format!("pack/Song {i}/Song {i}.sm")),
+                pack: 0,
+                difficulty: ChartDifficulty::Hard,
                 features: vec![0.0],
                 rating: (i % 19 + 1) as f32,
             })
@@ -1411,6 +1858,171 @@ mod tests {
         assert_eq!(take(&["--name", "x", "--name=y"]), Err("--name is given twice".into()));
         assert_eq!(take(&["--names", "x"]), Err("unknown option --names".into()));
         assert_eq!(take(&["--model", "x"]), Err("unknown option --model".into()));
+
+        let both = |given: &[&str]| take_options(&args(given), ["--folds", "--name"]);
+        let values = |folds: Option<&str>, name: Option<&str>| [folds.map(String::from), name.map(String::from)];
+        assert_eq!(both(&["songs", "--name=x", "--folds", "3"]), Ok((values(Some("3"), Some("x")), args(&["songs"]))));
+        assert_eq!(both(&["--folds", "3"]), Ok((values(Some("3"), None), vec![])));
+        assert_eq!(both(&["--folds", "3", "--folds=4"]), Err("--folds is given twice".into()));
+        assert_eq!(both(&["--name", "x", "--seed", "1"]), Err("unknown option --seed".into()));
+    }
+
+    fn sample(simfile: &str, difficulty: ChartDifficulty, rating: f32) -> Sample {
+        Sample { name: String::new(), simfile: PathBuf::from(simfile), pack: 0, difficulty, features: vec![0.0], rating }
+    }
+
+    #[test]
+    fn finds_song_folders_one_folder_down_in_steps_packs() {
+        let root = std::env::temp_dir().join(format!("ddr-trainer-song-root-{}", std::process::id()));
+        let file = |path: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        };
+        file("steps/Old Pack/Song A/Song A.sm");
+        file("steps/Old Pack/Song B/Song B.sm");
+        file("full/Song C/Song C.sm");
+        file("full/Song D/Song D.sm");
+        file("full/banner.png");
+        file("one song/Song E/Song E.ssc");
+        let found = |pack: &str| song_root(root.join(pack)).unwrap();
+        let (steps, full, one) = (found("steps"), found("full"), found("one song"));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!((steps, full, one), (root.join("steps/Old Pack"), root.join("full"), root.join("one song")));
+    }
+
+    #[test]
+    fn keeps_only_current_songs_of_older_packs() {
+        let text = "song_id,song_name,romanized_name,deleted,difficulty,level,tier,sanbai,score\n\
+                    a,Alpha,,0,Easy,3,0,3,0\na,Alpha,,0,Hard,9,0,9,0\n\
+                    b,ベータ,Beta,0,Hard,12,0,12,0\n\
+                    c,Tohoku EVOLVED,,0,Hard,10,0,10,0\n\
+                    d,Delta,,0,Hard,8,0,8,0\n";
+        let sanbai = Sanbai::parse(text).unwrap();
+        // Two older packs, then a newer one taken whole
+        let songs = [Songs::Current, Songs::Current, Songs::All];
+        let charts = [
+            ("old/Alpha/Alpha.sm", 0, ChartDifficulty::Hard, 9.0),
+            ("old/Beta (Chinese)/Beta.sm", 0, ChartDifficulty::Hard, 12.0),
+            ("old/Gamma/Gamma.sm", 0, ChartDifficulty::Hard, 5.0),
+            ("old/Tohoku EVOLVED (TYPE1)/Tohoku EVOLVED.sm", 0, ChartDifficulty::Hard, 10.0),
+            ("older/Alpha/Alpha.sm", 1, ChartDifficulty::Easy, 3.0),
+            ("older/Alpha/Alpha.sm", 1, ChartDifficulty::Hard, 9.0),
+            ("older/Alpha/Alpha.sm", 1, ChartDifficulty::Challenge, 11.0),
+            ("older/Delta/Delta.sm", 1, ChartDifficulty::Hard, 7.0),
+            ("older/Beta/Beta.sm", 1, ChartDifficulty::Hard, 12.0),
+            ("new/Beta/Beta.sm", 2, ChartDifficulty::Hard, 12.0),
+            ("new/Removed/Removed.sm", 2, ChartDifficulty::Easy, 4.0),
+        ];
+        let samples: Vec<Sample> = charts
+            .iter()
+            .map(|&(simfile, pack, difficulty, rating)| Sample { pack, ..sample(simfile, difficulty, rating) })
+            .collect();
+        let titles: HashMap<PathBuf, String> = charts
+            .iter()
+            .map(|&(simfile, ..)| {
+                let folder = folder_name(Path::new(simfile));
+                let title = if folder.starts_with("Beta") { "ベータ".to_string() } else { folder.replace(" (TYPE1)", "") };
+                (PathBuf::from(simfile), title)
+            })
+            .collect();
+        let (kept, left_out, missing_charts) = current_charts(samples, &songs, &titles, &sanbai);
+        let kept: Vec<(String, ChartDifficulty)> = kept.iter().map(|sample| (sample.simfile.display().to_string(), sample.difficulty)).collect();
+        assert_eq!(
+            kept,
+            [
+                ("older/Alpha/Alpha.sm".to_string(), ChartDifficulty::Easy),
+                ("older/Alpha/Alpha.sm".to_string(), ChartDifficulty::Hard),
+                ("new/Beta/Beta.sm".to_string(), ChartDifficulty::Hard),
+                ("new/Removed/Removed.sm".to_string(), ChartDifficulty::Easy),
+            ]
+        );
+        let expected = [
+            (LeftOut::Variant, 1),
+            (LeftOut::NotInGame, 1),
+            (LeftOut::Excluded, 1),
+            (LeftOut::RatedOtherwise, 1),
+            // old Alpha (older has it) and older Beta (new has it)
+            (LeftOut::OlderCopy, 2),
+        ];
+        assert_eq!(left_out, BTreeMap::from(expected));
+        // older Alpha's Challenge
+        assert_eq!(missing_charts, 1);
+    }
+
+    #[test]
+    fn groups_charts_by_song_with_covers() {
+        let samples = [
+            sample("pack/Song B/Song B.sm", ChartDifficulty::Easy, 3.0),
+            sample("pack/Song A/Song A.sm", ChartDifficulty::Easy, 3.0),
+            sample("pack/Song B/Song B.sm", ChartDifficulty::Hard, 9.0),
+            sample("pack/Song A (cover)/Song A (cover).ssc", ChartDifficulty::Hard, 9.0),
+            sample("other/Song C/Song C.sm", ChartDifficulty::Hard, 9.0),
+        ];
+        assert_eq!(song_ids(&samples), (vec![0, 1, 0, 1, 2], 3));
+    }
+
+    #[test]
+    fn deals_songs_into_folds_and_splits_each_by_song() {
+        let fold_of_song = song_folds(23, 5, 7);
+        assert_eq!(fold_of_song, song_folds(23, 5, 7), "seeded");
+        let sizes = (0..5).map(|fold| fold_of_song.iter().filter(|&&of| of == fold).count()).collect::<Vec<_>>();
+        assert_eq!(sizes, [5, 5, 5, 4, 4]);
+        assert_ne!(fold_of_song, song_folds(23, 5, 8));
+
+        // Two charts a song, three for every third
+        let song_of: Vec<usize> = (0..23).flat_map(|song| vec![song; 2 + usize::from(song % 3 == 0)]).collect();
+        for fold in 0..5 {
+            let (train, validation, test) = fold_split(&song_of, &fold_of_song, fold, 0.15, 7);
+            let songs = |rows: &[usize]| rows.iter().map(|&row| song_of[row]).collect::<HashSet<_>>();
+            let tested: HashSet<usize> = (0..23).filter(|&song| fold_of_song[song] == fold).collect();
+            assert_eq!(songs(&test), tested);
+            assert_eq!(songs(&validation).len(), 3, "15% of 23 songs");
+            assert!(songs(&train).is_disjoint(&songs(&validation)) && songs(&train).is_disjoint(&tested));
+            let mut all = [train, validation, test].concat();
+            all.sort();
+            assert_eq!(all, (0..song_of.len()).collect::<Vec<_>>(), "every row once");
+        }
+    }
+
+    #[test]
+    fn matches_charts_to_sanbai_by_title() {
+        let text = "song_id,song_name,romanized_name,deleted,difficulty,level,tier,sanbai,score\n\
+                    a,\"Hello, planet\",,0,Hard,12,0.4,12.40,0\n\
+                    b,恋,Koi,0,Easy,5,0.9,5.90,0\n\
+                    c,take me higher,,0,Hard,13,0.2,13.20,0\n\
+                    d,TAKE ME HIGHER,,0,Hard,16,0.6,16.60,0\n";
+        let sanbai = Sanbai::parse(text).unwrap();
+        let hard = ChartDifficulty::Hard;
+        // By either name, in any spacing and case
+        assert_eq!(sanbai.rating(&["Hello planet", "x"], hard, 12.0), Some(12.4));
+        assert_eq!(sanbai.rating(&["Koi", "恋"], ChartDifficulty::Easy, 5.0), Some(5.9));
+        // At another level, another difficulty, or no title
+        assert_eq!(sanbai.rating(&["Hello, planet"], hard, 13.0), None);
+        assert_eq!(sanbai.rating(&["Hello, planet"], ChartDifficulty::Easy, 12.0), None);
+        assert_eq!(sanbai.rating(&["Goodbye"], hard, 12.0), None);
+        // Two songs with one title
+        assert_eq!(sanbai.rating(&["take me higher"], hard, 13.0), None);
+        assert!(Sanbai::parse("song_id,level\n").is_err());
+    }
+
+    #[test]
+    fn correlates_verdicts_within_each_level() {
+        // Agreeing within each level, whatever the levels' own offsets
+        let agree = [(4.0, 1.0, 0.9), (4.0, 0.0, 0.1), (12.0, -2.0, 0.1), (12.0, -1.0, 0.9)];
+        assert!((within_level_r(&agree).unwrap() - 1.0).abs() < 1e-12);
+        let disagree = [(4.0, 1.0, 0.1), (4.0, 0.0, 0.9)];
+        assert!((within_level_r(&disagree).unwrap() + 1.0).abs() < 1e-12);
+        // One chart a level has no spread
+        assert_eq!(within_level_r(&[(4.0, 1.0, 0.1), (5.0, 0.0, 0.9)]), None);
+    }
+
+    #[test]
+    fn quotes_csv_fields_that_need_it() {
+        assert_eq!(csv_field("Fleur [Hard]"), "Fleur [Hard]");
+        assert_eq!(csv_field("Hello, planet [Easy]"), "\"Hello, planet [Easy]\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(cost_fit::parse_csv(&format!("{}\n", csv_field("a, \"b\""))), [vec!["a, \"b\"".to_string()]]);
     }
 
     #[test]
@@ -1435,7 +2047,7 @@ mod tests {
 
         // Runs saving in the same second each get a folder
         let root = std::env::temp_dir().join(format!("ddr-trainer-models-{}", std::process::id()));
-        let made: Vec<PathBuf> = (0..3).map(|_| new_model_dir(&root, at(1_764_120_615)).unwrap()).collect();
+        let made: Vec<PathBuf> = (0..3).map(|_| new_run_dir(&root, "model", at(1_764_120_615)).unwrap()).collect();
         let all_there = made.iter().all(|dir| dir.is_dir());
         fs::remove_dir_all(&root).unwrap();
         let names: Vec<_> = made.iter().map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned()).collect();
