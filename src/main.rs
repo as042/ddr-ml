@@ -21,9 +21,14 @@ const USAGE: &str = "\
 usage: ddr-trainer <tool> [arguments]
 
 tools:
-  train [songs]                train a rating model on a folder of song folders and save it
+  train [songs] [--name <name>]
+                               train a rating model on a folder of song folders and save it in
+                               artifacts/<name>/ (replacing what's there), or by default in a new
+                               artifacts/model_<UTC date>_<time>Z/
   pca [songs]                  fit a PCA of the chart statistics and save it
-  infer <simfile>...           rate each chart with the saved model
+  infer [--model <name>] <simfile>...
+                               rate each chart with the model saved in artifacts/<name>/, by
+                               default artifacts/a3_model3/
   feet <arrows> [speed]        foot one segment, e.g. UDDRLRURDL (a jump in brackets: L[UD]R;
                                a hold from D+ to D-, or to the end: D+RUD-L; a space is a
                                pause of one row: \"LR  UD\"). A row is a 16th at 120 BPM, or

@@ -7,7 +7,7 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     thread,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use burn::optim::AdamWConfig;
@@ -31,8 +31,11 @@ use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, TrainedModel, TrainingConfig};
 
 const CACHE_FILE: &str = "artifacts/stats_cache.json";
-const MODEL_DIR: &str = "artifacts/a3_model3/";
-/// In `MODEL_DIR` (see `ModelInputs`).
+/// Saved models are folders in here.
+const ARTIFACTS: &str = "artifacts";
+/// `infer`'s model when it isn't given one.
+const DEFAULT_MODEL: &str = "a3_model3";
+/// In a model's folder (see `ModelInputs`).
 const INPUTS_FILE: &str = "inputs.json";
 const PCA_FILE: &str = "artifacts/pca.json";
 /// Untracked (copyrighted), see data/.gitignore.
@@ -116,9 +119,12 @@ impl ModelInputs {
 
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
 /// chart in a folder of song folders (the argument, or the `DATASET` packs), and saves it to
-/// `MODEL_DIR`.
+/// `--name`'s folder in `ARTIFACTS`, or a new `new_model_dir`.
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (feature_names, samples) = cached_samples(&song_packs(args)?)?;
+    let (name, songs) = take_option(args, "--name")?;
+    // Before training, which takes minutes
+    let named_dir = name.map(|name| model_dir(&name)).transpose()?;
+    let (feature_names, samples) = cached_samples(&song_packs(&songs)?)?;
 
     // Small batches: with only a few hundred charts, they make more steps per epoch.
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
@@ -139,9 +145,13 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
         model_config.dropout
     );
     let (trained, test) = model_config.train(&dataset, &training);
-    trained.save(&model_config, MODEL_DIR)?;
-    ModelInputs::now(feature_names).save(Path::new(MODEL_DIR))?;
-    say!("\nsaved the model to {MODEL_DIR}/\n");
+    let dir = match named_dir {
+        Some(dir) => dir,
+        None => new_model_dir(Path::new(ARTIFACTS), SystemTime::now())?,
+    };
+    trained.save(&model_config, &dir)?;
+    ModelInputs::now(feature_names).save(&dir)?;
+    say!("\nsaved the model to {}/\n", dir.display());
 
     say!("{:<48} {:>6} {:>9}", "test chart", "rating", "predicted");
     for (&row, predicted) in test.rows.iter().zip(&test.predictions).take(EXAMPLES) {
@@ -164,17 +174,20 @@ pub fn pca(args: &[String]) -> Result<(), Box<dyn Error>> {
     report_pca(&feature_names, &samples)
 }
 
-/// Rates every dance-single chart of each simfile with the model in `MODEL_DIR`. Refuses if
-/// the model was trained on other statistics than charts have now.
+/// Rates every dance-single chart of each simfile with `--model`'s model in `ARTIFACTS`, or
+/// `DEFAULT_MODEL`. Refuses if the model was trained on other statistics than charts have now.
 pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
-    if args.is_empty() {
+    let (name, simfiles) = take_option(args, "--model")?;
+    if simfiles.is_empty() {
         return Err("infer needs a simfile or song folder".into());
     }
+    let dir = model_dir(name.as_deref().unwrap_or(DEFAULT_MODEL))?;
+    let shown = dir.display();
     let device = DevicePreference::default().device();
-    let model = TrainedModel::load(MODEL_DIR, &device)
-        .map_err(|e| format!("couldn't load the model in {MODEL_DIR} ({e}): has `train` been run?"))?;
-    let trained_on = ModelInputs::load(Path::new(MODEL_DIR))
-        .map_err(|e| format!("the model in {MODEL_DIR} doesn't say which statistics it takes ({e}): train it again"))?;
+    let model = TrainedModel::load(&dir, &device)
+        .map_err(|e| format!("couldn't load the model in {shown} ({e}): has `train` saved one there?"))?;
+    let trained_on = ModelInputs::load(&dir)
+        .map_err(|e| format!("the model in {shown} doesn't say which statistics it takes ({e}): train it again"))?;
     let names = ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect();
     if let Some(warning) = trained_on.check(&ModelInputs::now(names))? {
         eprintln!("warning: {warning}");
@@ -182,14 +195,14 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     // A mismatch would broadcast silently
     if trained_on.features.len() != model.model.num_inputs() {
         return Err(format!(
-            "the model in {MODEL_DIR} takes {} statistics, but {INPUTS_FILE} lists {}: train it again",
+            "the model in {shown} takes {} statistics, but {INPUTS_FILE} lists {}: train it again",
             model.model.num_inputs(),
             trained_on.features.len()
         )
         .into());
     }
     say!("{SCALE_NOTE}\n");
-    for path in args {
+    for path in &simfiles {
         let sim = SimFile::from_file(path).map_err(|e| format!("{path}: {e}"))?;
         say!("{} by {}", sim.title, sim.artist);
         say!("{:<10} {:>6} {:>9}", "chart", "rating", "predicted");
@@ -210,6 +223,69 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
         say!();
     }
     Ok(())
+}
+
+/// `--option value` or `--option=value`, at most once, and the other arguments in order. Any
+/// other `--` argument is an error.
+fn take_option(args: &[String], option: &str) -> Result<(Option<String>, Vec<String>), String> {
+    let (mut value, mut rest) = (None, Vec::new());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let given = match arg.strip_prefix(option) {
+            Some("") => args.next().ok_or_else(|| format!("{option} needs a value"))?,
+            Some(after) if after.starts_with('=') => &after[1..],
+            _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
+            _ => {
+                rest.push(arg.clone());
+                continue;
+            }
+        };
+        if value.replace(given.to_string()).is_some() {
+            return Err(format!("{option} is given twice"));
+        }
+    }
+    Ok((value, rest))
+}
+
+/// A model's folder in `ARTIFACTS`. The name is one folder name, so the model stays in there.
+fn model_dir(name: &str) -> Result<PathBuf, String> {
+    match name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        true => Err(format!("a model name is a folder name in {ARTIFACTS}/, not {name:?}")),
+        false => Ok(Path::new(ARTIFACTS).join(name)),
+    }
+}
+
+/// A new folder in `root` named after `time` (`model_20261126_013015Z`, UTC), with `_2`, `_3`
+/// and so on if a run saved in the same second.
+fn new_model_dir(root: &Path, time: SystemTime) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let stamp = utc_stamp(time);
+    let mut copy = 1;
+    loop {
+        let name = if copy == 1 { format!("model_{stamp}") } else { format!("model_{stamp}_{copy}") };
+        let dir = root.join(name);
+        // Fails if it's there, so two runs can't take the same folder
+        match fs::create_dir(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => copy += 1,
+            made => return made.map(|()| dir),
+        }
+    }
+}
+
+/// `YYYYMMDD_HHMMSSZ`, in UTC.
+fn utc_stamp(time: SystemTime) -> String {
+    let seconds = time.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let (days, second) = ((seconds / 86_400) as i64, seconds % 86_400);
+    // Howard Hinnant's civil_from_days: years from March, so leap days come last
+    let shifted = days + 719_468;
+    let (era, day_of_era) = (shifted.div_euclid(146_097), shifted.rem_euclid(146_097));
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 { month_from_march + 3 } else { month_from_march - 9 };
+    let year = era * 400 + year_of_era + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}_{:02}{:02}{:02}Z", second / 3600, second / 60 % 60, second % 60)
 }
 
 /// Prints the cheapest footing (see `chart_analyzer::footing`) of arrow letters as one
@@ -1229,6 +1305,51 @@ mod tests {
         assert!(enough_charts(2, &config, 2).is_err());
         assert!(enough_charts(3, &config, 2).is_err());
         assert!(enough_charts(0, &config, 2).is_err());
+    }
+
+    #[test]
+    fn takes_one_option_out_of_the_arguments() {
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let take = |given: &[&str]| take_option(&args(given), "--name");
+        assert_eq!(take(&[]), Ok((None, vec![])));
+        assert_eq!(take(&["songs"]), Ok((None, args(&["songs"]))));
+        assert_eq!(take(&["--name", "x", "songs"]), Ok((Some("x".into()), args(&["songs"]))));
+        assert_eq!(take(&["songs", "--name=x"]), Ok((Some("x".into()), args(&["songs"]))));
+        assert_eq!(take(&["--name="]), Ok((Some(String::new()), vec![])));
+        assert_eq!(take(&["--name"]), Err("--name needs a value".into()));
+        assert_eq!(take(&["--name", "x", "--name=y"]), Err("--name is given twice".into()));
+        assert_eq!(take(&["--names", "x"]), Err("unknown option --names".into()));
+        assert_eq!(take(&["--model", "x"]), Err("unknown option --model".into()));
+    }
+
+    #[test]
+    fn keeps_models_in_artifacts() {
+        assert_eq!(model_dir("a3_model3"), Ok(Path::new("artifacts/a3_model3").to_path_buf()));
+        assert_eq!(model_dir("model 2026-11-25.v2"), Ok(Path::new("artifacts/model 2026-11-25.v2").to_path_buf()));
+        for name in ["", ".", "..", "../elsewhere", "nested/model", "/tmp/model", "back\\slash"] {
+            assert!(model_dir(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn names_new_models_by_utc_time() {
+        let at = |seconds: u64| UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        assert_eq!(utc_stamp(at(0)), "19700101_000000Z");
+        // Leap days, the end of a day and a year, and 2100, which isn't a leap year
+        assert_eq!(utc_stamp(at(951_782_400)), "20000229_000000Z");
+        assert_eq!(utc_stamp(at(951_868_799)), "20000229_235959Z");
+        assert_eq!(utc_stamp(at(1_735_689_599)), "20241231_235959Z");
+        assert_eq!(utc_stamp(at(1_764_120_615)), "20251126_013015Z");
+        assert_eq!(utc_stamp(at(4_107_542_400)), "21000301_000000Z");
+
+        // Runs saving in the same second each get a folder
+        let root = std::env::temp_dir().join(format!("ddr-trainer-models-{}", std::process::id()));
+        let made: Vec<PathBuf> = (0..3).map(|_| new_model_dir(&root, at(1_764_120_615)).unwrap()).collect();
+        let all_there = made.iter().all(|dir| dir.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+        let names: Vec<_> = made.iter().map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["model_20251126_013015Z", "model_20251126_013015Z_2", "model_20251126_013015Z_3"]);
+        assert!(all_there);
     }
 
     #[test]
