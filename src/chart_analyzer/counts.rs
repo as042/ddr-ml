@@ -7,7 +7,7 @@ use std::ops::Range;
 use super::footing::moves::Move;
 use super::statistics::{BURST_NOTES, ChartStatistics, NOTE_SUB_DIVS, SUSTAINED_SECONDS, Spread};
 use super::technique::speed;
-use super::{Settings, TIME_EPSILON, TimedNote, Timing, arrows, row_beat};
+use super::{FINEST_PER_BEAT, Settings, TIME_EPSILON, TimedNote, Timing, arrows, grid_of, row_beat};
 use crate::sim_loader::{Measure, Note};
 
 /// Every statistic but the techniques' and the footing's costs. `notes`: the measures', timed.
@@ -21,10 +21,12 @@ pub(super) fn count(
     settings: &Settings,
     stats: &mut ChartStatistics,
 ) {
-    let span = count_notes_and_rhythms(measures, stats);
+    let span = count_notes_and_rhythms(measures, notes, stats);
     count_bpms(timing, span, stats);
     count_duration(notes, timing, span, settings.active_gap_seconds, stats);
     count_stops(timing, span, stats);
+    count_note_bpms(notes, timing, stats);
+    count_run_stops(notes, timing, settings.active_gap_seconds, stats);
     count_arrows(notes, stats);
     count_holds(notes, stats);
     count_notes_per_second(motions, settings, stats);
@@ -188,14 +190,62 @@ fn count_stops(timing: &Timing, span: Option<(f64, f64)>, stats: &mut ChartStati
     }
 }
 
+/// The stops between two notes `active_gap_seconds` apart at most, once the stops between
+/// them are taken out. A stop on a note's beat comes after the note.
+fn count_run_stops(notes: &[TimedNote], timing: &Timing, active_gap_seconds: f64, stats: &mut ChartStatistics) {
+    for pair in notes.windows(2) {
+        let between: Vec<f64> =
+            timing.stops.iter().filter(|&&(beat, _)| pair[0].beat <= beat && beat < pair[1].beat).map(|&(_, seconds)| seconds).collect();
+        let stopped: f64 = between.iter().sum();
+        if pair[1].time - pair[0].time - stopped <= active_gap_seconds + TIME_EPSILON {
+            stats.num_run_stops += between.len();
+            stats.run_stop_seconds += stopped;
+        }
+    }
+}
+
+/// The BPM at each note, and how it changes from one note to the next.
+fn count_note_bpms(notes: &[TimedNote], timing: &Timing, stats: &mut ChartStatistics) {
+    let bpms: Vec<f64> = notes.iter().map(|note| timing.bpm_at(note.beat)).collect();
+    for pair in bpms.windows(2).filter(|pair| pair[0] > 0.0 && pair[1] > 0.0 && pair[0] != pair[1]) {
+        let octaves = (pair[1] / pair[0]).log2();
+        stats.note_bpm_travel += octaves.abs();
+        if octaves > 0.0 {
+            stats.num_note_speedups += 1;
+            stats.max_note_speedup = stats.max_note_speedup.max(octaves);
+        } else {
+            stats.num_note_slowdowns += 1;
+            stats.max_note_slowdown = stats.max_note_slowdown.max(-octaves);
+        }
+    }
+    let bpms = Spread::of(bpms);
+    (stats.mean_note_bpm, stats.median_note_bpm, stats.min_note_bpm, stats.max_note_bpm) = (bpms.mean, bpms.median, bpms.min, bpms.max);
+}
+
+/// `segments`: each one's notes (see `segments`). Gaps between segments aren't counted.
+pub(super) fn count_rhythms(segments: &[&[TimedNote]], stats: &mut ChartStatistics) {
+    // Beats from a note to the next, in millionths, to how many times
+    let mut gaps: BTreeMap<i64, usize> = BTreeMap::new();
+    for pair in segments.iter().flat_map(|notes| notes.windows(2)) {
+        *gaps.entry(((pair[1].beat - pair[0].beat) * 1e6).round() as i64).or_default() += 1;
+    }
+    let all = gaps.values().sum::<usize>() as f64;
+    let entropy = |&count: &usize| {
+        let share = count as f64 / all;
+        -share * share.log2()
+    };
+    stats.rhythm_entropy = gaps.values().map(entropy).sum();
+}
+
 /// The key with the highest count. Ties go to the smallest. 0 if there are none.
 fn most_common(counts: &BTreeMap<usize, usize>) -> usize {
     // `max_by_key` keeps the last maximum, so `rev` sends ties to the smallest.
     counts.iter().rev().max_by_key(|&(_, &count)| count).map_or(0, |(&key, _)| key)
 }
 
-/// Returns the beats of the first and last non-empty rows, or None for an empty chart.
-fn count_notes_and_rhythms(measures: &[Measure], stats: &mut ChartStatistics) -> Option<(f64, f64)> {
+/// `notes`: the measures', in order. Returns the beats of the first and last non-empty rows, or
+/// None for an empty chart.
+fn count_notes_and_rhythms(measures: &[Measure], notes: &[TimedNote], stats: &mut ChartStatistics) -> Option<(f64, f64)> {
     // Subdivision -> number of measures, and of notes
     let mut sub_div_measures: BTreeMap<usize, usize> = BTreeMap::new();
     let mut sub_div_notes: BTreeMap<usize, usize> = BTreeMap::new();
@@ -226,10 +276,10 @@ fn count_notes_and_rhythms(measures: &[Measure], stats: &mut ChartStatistics) ->
             if arrows == 0 {
                 continue;
             }
+            let note_sub_div = note_sub_div(&notes[stats.num_notes]);
             stats.num_notes += 1;
-            let row_sub_div = row_sub_div(measure, r);
-            *sub_div_notes.entry(row_sub_div).or_default() += 1;
-            sub_div = Some(sub_div.map_or(row_sub_div, |s| lcm(s, row_sub_div)));
+            *sub_div_notes.entry(note_sub_div).or_default() += 1;
+            sub_div = Some(sub_div.map_or(note_sub_div, |s| lcm(s, note_sub_div)));
         }
         if let Some(s) = sub_div {
             *sub_div_measures.entry(s).or_default() += 1;
@@ -260,6 +310,7 @@ fn count_notes_and_rhythms(measures: &[Measure], stats: &mut ChartStatistics) ->
         stats.mean_note_sub_div = sub_div_notes.iter().map(|(&s, &count)| (s * count) as f64).sum::<f64>() / notes;
         let advanced: usize = sub_div_notes.iter().filter(|&(&s, _)| !s.is_power_of_two()).map(|(_, &count)| count).sum();
         stats.adv_sub_div_note_ratio = advanced as f64 / notes;
+        stats.offbeat_note_ratio = 1.0 - sub_div_notes.get(&4).copied().unwrap_or(0) as f64 / notes;
     }
 
     first_used.map(|(_, first_beat)| (first_beat, last_used.1))
@@ -296,8 +347,13 @@ fn count_bpms(timing: &Timing, span: Option<(f64, f64)>, stats: &mut ChartStatis
     stats.bpm_range = stats.max_bpm - stats.min_bpm;
 }
 
-/// The row's subdivision, as in "16th notes": 4 on a beat, 8 halfway between two, 12 a third of
-/// the way, and so on.
+/// The note's subdivision, as in "16th notes": 4 on a beat, 8 halfway between two, 12 a third
+/// of the way, and so on, by its `heard_beat`. `row_sub_div` unless a stop moved the beat.
+fn note_sub_div(note: &TimedNote) -> usize {
+    4 * grid_of(note.heard_beat).unwrap_or(FINEST_PER_BEAT)
+}
+
+/// The row's subdivision as written (see `note_sub_div`).
 pub(super) fn row_sub_div(measure: &Measure, row: usize) -> usize {
     // Denominator of `row * num_beats / rows` in lowest terms, times 4 (a beat is a quarter note)
     let rows = measure.rows.len();
@@ -344,8 +400,13 @@ mod tests {
             (20, 1, 20),
         ];
         for (rows, row, expected) in cases {
-            let measure = Measure { num_beats: 4, rows: vec![[Note::Empty; 4]; rows] };
+            let mut measure = Measure { num_beats: 4, rows: vec![[Note::Empty; 4]; rows] };
             assert_eq!(row_sub_div(&measure, row), expected, "row {row} of a {rows}-row measure");
+            // A note there, in the second measure, has the same
+            measure.rows[row][0] = Note::Tap;
+            let empty = Measure { num_beats: 4, rows: vec![[Note::Empty; 4]; 4] };
+            let notes = super::super::to_timed_notes(&[empty, measure], &Timing::new(&[], &[]));
+            assert_eq!(note_sub_div(&notes[0]), expected, "a note on row {row} of a {rows}-row measure");
         }
     }
 
@@ -509,7 +570,8 @@ mod tests {
             rows[row][0] = Note::Tap;
         }
         let mut s = ChartStatistics::default();
-        count_notes_and_rhythms(&[Measure { num_beats: 4, rows }], &mut s);
+        let measures = [Measure { num_beats: 4, rows }];
+        count_notes_and_rhythms(&measures, &super::super::to_timed_notes(&measures, &Timing::new(&[], &[])), &mut s);
         assert_eq!((s.sub_div_notes[0], s.other_sub_div_notes), (1, 2));
         assert_eq!((s.num_note_sub_divs, s.mode_note_sub_div, s.finest_note_sub_div), (2, 20, 20));
     }
@@ -568,6 +630,80 @@ mod tests {
         let mut s = ChartStatistics { chart_dur: 16.0, ..Default::default() };
         count_stops(&timing, Some((4.0, 8.0)), &mut s);
         assert_eq!((s.num_stops, s.total_stop_seconds, s.min_stop_seconds, s.max_stop_seconds, s.stop_ratio), (2, 4.0, 1.0, 3.0, 0.25));
+    }
+
+    #[test]
+    fn measures_rhythm() {
+        let entropy = |gaps: &[usize]| {
+            let all = gaps.iter().sum::<usize>() as f64;
+            gaps.iter().map(|&count| -(count as f64 / all) * (count as f64 / all).log2()).sum::<f64>()
+        };
+        // (difficulty, off-beat share, how many gaps of each length)
+        let expected: [(_, f64, &[usize]); 4] = [
+            (Beginner, 0.0, &[]),
+            (Easy, 11.0 / 23.0, &[8, 5, 4, 3, 1, 1]),
+            (Medium, 1.0 / 3.0, &[8, 3]),
+            (Hard, 0.0, &[13, 1]),
+        ];
+        for (difficulty, offbeat, gaps) in expected {
+            let s = stats("rhythm_stats.sm", difficulty);
+            assert_close(s.offbeat_note_ratio, offbeat, &format!("{difficulty:?} off-beat share"));
+            assert_close(s.rhythm_entropy, entropy(gaps), &format!("{difficulty:?} rhythm entropy"));
+        }
+        // As the fixture's header has them
+        assert!((stats("rhythm_stats.sm", Easy).rhythm_entropy - 2.2610).abs() < 5e-5);
+        assert!((stats("rhythm_stats.sm", Medium).rhythm_entropy - 0.8454).abs() < 5e-5);
+
+        // Two gaps of a beat and one of a half. The 4 beats between the segments aren't a gap.
+        let tap = |beat: f64| TimedNote {
+            time: beat,
+            beat,
+            heard_beat: beat,
+            row: [Note::Tap, Note::Empty, Note::Empty, Note::Empty],
+            hold_ends: [None; 4],
+        };
+        let (first, second) = ([tap(0.0), tap(1.0), tap(2.0)], [tap(6.0), tap(6.5)]);
+        let mut s = ChartStatistics::default();
+        count_rhythms(&[&first, &second], &mut s);
+        assert_close(s.rhythm_entropy, entropy(&[2, 1]), "two segments");
+        let mut s = ChartStatistics::default();
+        count_rhythms(&[&first[..1], &second[..1]], &mut s);
+        assert_eq!(s.rhythm_entropy, 0.0, "no gaps");
+    }
+
+    #[test]
+    fn finds_the_tempo_at_the_notes() {
+        // (difficulty, BPM at the notes: (mean, median, min, max), (speedups, slowdowns),
+        // octaves: (travel, largest speedup, largest slowdown))
+        let steady = |bpm: f64| ((bpm, bpm, bpm, bpm), (0, 0), (0.0, 0.0, 0.0));
+        let expected = [
+            (Beginner, steady(0.0)),
+            (Easy, steady(120.0)),
+            (Hard, ((168.0, 120.0, 60.0, 480.0), (3, 1), (6.0, 2.0, 2.0))),
+            (Challenge, steady(120.0)),
+        ];
+        for (difficulty, (bpms, changes, octaves)) in expected {
+            let s = stats("rhythm_stats.sm", difficulty);
+            assert_eq!((s.mean_note_bpm, s.median_note_bpm, s.min_note_bpm, s.max_note_bpm), bpms, "{difficulty:?}: (mean, median, min, max)");
+            assert_eq!((s.num_note_speedups, s.num_note_slowdowns), changes, "{difficulty:?}: (speedups, slowdowns)");
+            assert_close(s.note_bpm_travel, octaves.0, &format!("{difficulty:?} travel"));
+            assert_close(s.max_note_speedup, octaves.1, &format!("{difficulty:?} largest speedup"));
+            assert_close(s.max_note_slowdown, octaves.2, &format!("{difficulty:?} largest slowdown"));
+        }
+        // The notes meet 4 of Hard's changes: one has no note in it, one is on the last note
+        assert_eq!(stats("rhythm_stats.sm", Hard).num_bpm_changes, 5);
+    }
+
+    #[test]
+    fn counts_stops_in_runs() {
+        // (difficulty, stops, their seconds, stops in a run, their seconds)
+        let expected = [(Beginner, 0, 0.0, 0, 0.0), (Easy, 0, 0.0, 0, 0.0), (Hard, 0, 0.0, 0, 0.0), (Challenge, 6, 4.25, 4, 1.75)];
+        for (difficulty, stops, seconds, in_runs, run_seconds) in expected {
+            let s = stats("rhythm_stats.sm", difficulty);
+            assert_eq!((s.num_stops, s.num_run_stops), (stops, in_runs), "{difficulty:?}: (stops, in a run)");
+            assert_close(s.total_stop_seconds, seconds, &format!("{difficulty:?} stopped"));
+            assert_close(s.run_stop_seconds, run_seconds, &format!("{difficulty:?} stopped in runs"));
+        }
     }
 
     #[test]

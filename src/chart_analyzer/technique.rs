@@ -14,6 +14,10 @@ pub enum Technique {
     Stream,
     /// A note under a hold or roll that started on an earlier note
     HeldStep,
+    /// A note off the beat with no note on the next stronger position (see `sequences`)
+    Syncopation,
+    /// A note with uneven gaps before and after it
+    RhythmChange,
 
     // Events of the foot simulation (see `footing::Events`)
     Jack,
@@ -51,11 +55,13 @@ pub enum Source {
 }
 
 impl Technique {
-    pub const ALL: [Technique; 23] = [
+    pub const ALL: [Technique; 25] = [
         Technique::RepeatedArrow,
         Technique::Jump,
         Technique::Stream,
         Technique::HeldStep,
+        Technique::Syncopation,
+        Technique::RhythmChange,
         Technique::Jack,
         Technique::VerticalFootswitch,
         Technique::UpFootswitch,
@@ -88,6 +94,8 @@ impl Technique {
             Technique::Jump => "jump",
             Technique::Stream => "stream",
             Technique::HeldStep => "held step",
+            Technique::Syncopation => "syncopation",
+            Technique::RhythmChange => "rhythm change",
             Technique::Jack => "jack",
             Technique::VerticalFootswitch => "vertical footswitch",
             Technique::UpFootswitch => "up footswitch",
@@ -127,7 +135,12 @@ impl Technique {
 
     pub fn source(self) -> Source {
         match self {
-            Technique::RepeatedArrow | Technique::Jump | Technique::Stream | Technique::HeldStep => Source::Notes,
+            Technique::RepeatedArrow
+            | Technique::Jump
+            | Technique::Stream
+            | Technique::HeldStep
+            | Technique::Syncopation
+            | Technique::RhythmChange => Source::Notes,
             Technique::Staircase | Technique::Drill | Technique::Gallop | Technique::Triple => Source::FootingPattern,
             _ => Source::FootingEvent,
         }
@@ -147,8 +160,7 @@ impl Technique {
         matches!(self, Technique::Stream | Technique::Drill)
     }
 
-    /// A position of the feet, as hard to leave fast as to enter fast: timed by the shorter of
-    /// the gaps before and after its note. The rest are timed by the gap before.
+    /// A position of the feet, as hard to leave fast as to enter fast.
     pub fn is_position(self) -> bool {
         matches!(
             self,
@@ -159,6 +171,12 @@ impl Technique {
                 | Technique::HalfSpin
                 | Technique::FullSpin
         )
+    }
+
+    /// Timed by the shorter of the gaps before and after its note: a position, or a rhythm
+    /// change, which is both its gaps. The rest are timed by the gap before.
+    pub fn timed_by_either_gap(self) -> bool {
+        self.is_position() || self == Technique::RhythmChange
     }
 }
 
@@ -175,11 +193,12 @@ pub struct Occurrence {
 }
 
 impl Occurrence {
-    /// What the step of note `i` does, at the speed of the gap before it (for a position, the
-    /// shorter of the gaps before and after). 0 with no such gap in the segment.
+    /// What the step of note `i` does, at the speed of the gap before it, or of the shorter of
+    /// the gaps before and after (see `Technique::timed_by_either_gap`). 0 with no such gap in
+    /// the segment.
     pub fn at(technique: Technique, segment: &[TimedNote], i: usize) -> Occurrence {
         let (before, after) = gaps(segment, i);
-        let gap = if technique.is_position() { before.min(after) } else { before };
+        let gap = if technique.timed_by_either_gap() { before.min(after) } else { before };
         Occurrence { technique, note: i, notes: 1, speed: speed(gap) }
     }
 
@@ -278,6 +297,11 @@ mod tests {
         assert_eq!(Technique::DownFootswitch.counted(2), "2 down footswitches");
         assert_eq!(Technique::HalfCrossover.source(), Source::FootingEvent);
         assert!(Technique::FullCrossover.is_position() && Technique::Jack.kinds().is_empty());
+        assert_eq!(Technique::RhythmChange.key(), "rhythm_change");
+        assert_eq!(Technique::Syncopation.counted(2), "2 syncopations");
+        assert_eq!((Technique::Syncopation.source(), Technique::RhythmChange.source()), (Source::Notes, Source::Notes));
+        assert!(Technique::RhythmChange.timed_by_either_gap() && !Technique::RhythmChange.is_position());
+        assert!(Technique::Lateral.timed_by_either_gap() && !Technique::Syncopation.timed_by_either_gap());
     }
 
     #[test]
@@ -293,6 +317,8 @@ mod tests {
         assert_eq!(at(Technique::HorizontalCrossover, 2).speed, 4.0);
         assert_eq!(at(Technique::Doublestep, 1).speed, 8.0);
         assert_eq!(at(Technique::HorizontalCrossover, 1).speed, 8.0);
+        assert_eq!((at(Technique::RhythmChange, 2).speed, at(Technique::Syncopation, 2).speed), (4.0, 4.0));
+        assert_eq!((at(Technique::RhythmChange, 1).speed, at(Technique::RhythmChange, 0).speed), (8.0, 8.0));
         // No note before
         assert_eq!(at(Technique::Bracket, 0).speed, 0.0);
         assert_eq!(at(Technique::HorizontalCrossover, 0).speed, 8.0);

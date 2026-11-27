@@ -1,3 +1,4 @@
+mod compression;
 mod counts;
 mod footing;
 mod radar;
@@ -169,6 +170,9 @@ pub fn analyze_chart(chart: &SingleChart, bpms: &[BPMChange], stops: &[Stop], co
     let mut stats = ChartStatistics::default();
     counts::count(&chart.measures, &notes, &motions(&segments, settings), &timing, settings, &mut stats);
     radar::count(&chart.measures, &timing, &mut stats);
+    let runs: Vec<&[TimedNote]> = segments.iter().map(|segment| &segment.notes[..]).collect();
+    counts::count_rhythms(&runs, &mut stats);
+    compression::count(&notes, &mut stats);
 
     let occurrences: Vec<technique::Occurrence> =
         segments.iter().flat_map(|segment| segment.from_notes.iter().chain(&segment.footing.occurrences)).copied().collect();
@@ -198,6 +202,12 @@ fn motions(segments: &[AnalyzedSegment], settings: &Settings) -> Vec<TimedNote> 
 /// Tolerance for rounding in beat-to-second conversion. Far below any real note gap (192nds at
 /// 1000 BPM are 1.25 ms apart).
 const TIME_EPSILON: f64 = 1e-6;
+/// Tolerance for rounding in beats. Far below the finest row (192nd notes are 1/48 of a beat).
+const BEAT_EPSILON: f64 = 1e-6;
+/// Positions per beat of the finest grid a note is looked for on
+const FINEST_PER_BEAT: usize = 192;
+/// A stop's length is rounded to one of these a beat: StepMania's rows, 192 to a measure.
+const STOP_UNITS_PER_BEAT: i64 = 48;
 
 /// A song's BPM changes and stops.
 struct Timing {
@@ -251,6 +261,9 @@ pub struct TimedNote {
     /// Seconds from beat 0
     pub time: f64,
     pub beat: f64,
+    /// `beat` plus what the stops before it moved the beat by (see `hear`). Where the note sits
+    /// against the beat is read from this.
+    pub heard_beat: f64,
     /// The whole row, including mines and hold ends
     pub row: [Note; 4],
     /// Per arrow: when the hold or roll starting here ends
@@ -290,12 +303,70 @@ fn to_timed_notes(measures: &[Measure], timing: &Timing) -> Vec<TimedNote> {
                         holding[arrow] = Some(notes.len());
                     }
                 }
-                notes.push(TimedNote { time, beat, row: *row, hold_ends: [None; 4] });
+                notes.push(TimedNote { time, beat, heard_beat: beat, row: *row, hold_ends: [None; 4] });
             }
         }
         measure_start += measure.num_beats;
     }
+    hear(&mut notes, timing);
     notes
+}
+
+/// Positions per beat of the coarsest grid `beat` is on: 1 on a beat, 2 for an 8th note, 3 for
+/// a 12th, 4 for a 16th. None if it's on none to `FINEST_PER_BEAT`.
+fn grid_of(beat: f64) -> Option<usize> {
+    (1..=FINEST_PER_BEAT).find(|&per_beat| {
+        let position = beat * per_beat as f64;
+        (position - position.round()).abs() < BEAT_EPSILON
+    })
+}
+
+/// Sets each note's `heard_beat`. A stop that isn't a whole number of beats long either leaves
+/// the beat where it's written (the music waits too) or moves it by its own length (the music
+/// goes on), and the timing doesn't say which. The notes do: each stretch of them between two
+/// stops takes, of the shifts the stops before it could add up to (any of them, each rounded
+/// to `STOP_UNITS_PER_BEAT`), the one that puts its notes on the coarsest grids (`grid_of`,
+/// added up). On a tie it stays with the stretch before, or else takes all the stops since. A
+/// note on a stop's beat is before the stop.
+fn hear(notes: &mut [TimedNote], timing: &Timing) {
+    const UNITS: i64 = STOP_UNITS_PER_BEAT;
+    // Bit `p`: the stops so far could add up to `p` units more than whole beats
+    let mut reachable: u64 = 1;
+    // Units the beat has moved by, and those of the stops since a stretch was last judged
+    let (mut shift, mut pending) = (0, 0);
+    let mut next = 0;
+    for stretch in 0..=timing.stops.len() {
+        if let Some(&(beat, seconds)) = stretch.checked_sub(1).map(|stop| &timing.stops[stop]) {
+            let units = (seconds * timing.bpm_at(beat) / 60.0 * UNITS as f64).round().max(0.0) as i64;
+            let turn = units % UNITS;
+            reachable |= (reachable << turn | reachable >> (UNITS - turn)) & ((1 << UNITS) - 1);
+            pending += units;
+        }
+        let end = timing.stops.get(stretch).map_or(f64::INFINITY, |&(beat, _)| beat);
+        let first = next;
+        while next < notes.len() && notes[next].beat <= end {
+            next += 1;
+        }
+        let stretch = &mut notes[first..next];
+        if stretch.is_empty() {
+            continue;
+        }
+        let misfit = |phase: i64| -> usize {
+            let moved = phase as f64 / UNITS as f64;
+            stretch.iter().map(|note| grid_of(note.beat + moved).unwrap_or(FINEST_PER_BEAT)).sum()
+        };
+        let phase = shift % UNITS;
+        let phases: Vec<i64> = (0..UNITS).filter(|&phase| reachable >> phase & 1 == 1).collect();
+        let best = phases.iter().map(|&phase| misfit(phase)).min().unwrap_or(0);
+        if misfit(phase) > best {
+            let nearest = phases.iter().filter(|&&other| misfit(other) == best).map(|&other| (other - phase).rem_euclid(UNITS)).min();
+            shift += if misfit((phase + pending) % UNITS) == best { pending } else { nearest.unwrap_or(0) };
+        }
+        pending = 0;
+        for note in stretch {
+            note.heard_beat = note.beat + shift as f64 / UNITS as f64;
+        }
+    }
 }
 
 /// Runs of notes (in time order) with no gap longer than `break_seconds`, unless a hold is
@@ -418,7 +489,8 @@ pub fn foot_arrows(arrows: &str, costs: &Costs, speed: f64) -> Result<FootedSegm
                 }
             }
             // Beats as for 16ths
-            notes.push(TimedNote { time, beat: index as f64 * 0.25, row: *row, hold_ends: [None; 4] });
+            let beat = index as f64 * 0.25;
+            notes.push(TimedNote { time, beat, heard_beat: beat, row: *row, hold_ends: [None; 4] });
         }
     }
     let end = rows.len() as f64 * gap;
@@ -634,6 +706,91 @@ mod tests {
         assert_eq!(notes[8].hold_ends, [Some(6.0), None, None, None]);
     }
 
+    /// Where taps on `beats` are heard, at 120 BPM with `stops`: (beat, seconds).
+    fn heard(beats: &[f64], stops: &[(f64, f64)]) -> Vec<f64> {
+        let stops: Vec<Stop> = stops.iter().map(|&(beat, seconds)| Stop { beat, seconds }).collect();
+        let timing = Timing::new(&[BPMChange { beat: 0.0, bpm: 120.0 }], &stops);
+        let tap = [Note::Tap, Note::Empty, Note::Empty, Note::Empty];
+        let note = |&beat: &f64| TimedNote { time: timing.time_at(beat), beat, heard_beat: beat, row: tap, hold_ends: [None; 4] };
+        let mut notes: Vec<TimedNote> = beats.iter().map(note).collect();
+        hear(&mut notes, &timing);
+        notes.iter().map(|note| note.heard_beat).collect()
+    }
+
+    #[test]
+    fn hears_the_beat_where_the_notes_put_it_after_a_stop() {
+        // 0.25 s is half a beat, 0.5 s a beat
+        let half = [(4.0, 0.25)];
+        assert_eq!(heard(&[0.0, 1.5, 2.25], &[]), [0.0, 1.5, 2.25]);
+        // Half a beat late as written: on the beat. The note on the stop's beat is before it.
+        assert_eq!(heard(&[3.0, 4.0, 4.5, 5.5, 6.5], &half), [3.0, 4.0, 5.0, 6.0, 7.0]);
+        // On the beat as written: the music waited
+        assert_eq!(heard(&[3.0, 4.0, 5.0, 6.0, 7.0], &half), [3.0, 4.0, 5.0, 6.0, 7.0]);
+        // 8ths are as much on the beat either way: as written
+        assert_eq!(heard(&[4.0, 4.5, 5.0, 5.5, 6.0], &half), [4.0, 4.5, 5.0, 5.5, 6.0]);
+        // A whole beat moves nothing, and a stop of no length doesn't count
+        assert_eq!(heard(&[4.0, 4.5, 5.5, 6.5], &[(4.0, 0.5)]), [4.0, 4.5, 5.5, 6.5]);
+        assert_eq!(heard(&[4.0, 4.5, 5.5, 6.5], &[(4.0, -0.25)]), [4.0, 4.5, 5.5, 6.5]);
+        // 0.3 s is 0.6 of a beat: neither as written nor moved by it is on a grid, so as written
+        assert_eq!(heard(&[4.0, 4.5, 5.5, 6.5], &[(4.0, 0.3)]), [4.0, 4.5, 5.5, 6.5]);
+        // A stop before the first note counts: a quarter of a beat
+        assert_eq!(heard(&[8.75, 9.75, 10.75], &[(4.0, 0.125)]), [9.0, 10.0, 11.0]);
+
+        // Two stops with no note between, of 3/4 and 1/2 a beat: both, or one of them
+        let two = [(12.0, 0.375), (13.0, 0.25)];
+        assert_eq!(heard(&[11.0, 12.0, 13.75, 14.75], &two), [11.0, 12.0, 15.0, 16.0]);
+        assert_eq!(heard(&[11.0, 12.0, 13.5, 14.5], &two), [11.0, 12.0, 14.0, 15.0]);
+        assert_eq!(heard(&[11.0, 12.0, 13.25, 14.25], &two), [11.0, 12.0, 14.0, 15.0]);
+        assert_eq!(heard(&[11.0, 12.0, 14.0, 15.0], &two), [11.0, 12.0, 14.0, 15.0]);
+
+        // A moved beat stays moved through a whole-beat stop, and two halves make a whole
+        let stays = heard(&[4.5, 5.5, 6.5, 7.5, 8.5, 9.5], &[(4.0, 0.25), (8.0, 0.5)]);
+        assert_eq!(stays, [5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+        let back = heard(&[4.5, 5.5, 6.5, 7.5, 9.0, 10.0, 11.0], &[(4.0, 0.25), (8.0, 0.25)]);
+        assert_eq!(back, [5.0, 6.0, 7.0, 8.0, 10.0, 11.0, 12.0]);
+        // Two stops on one beat
+        assert_eq!(heard(&[4.0, 4.75, 5.75], &[(4.0, 0.0625), (4.0, 0.0625)]), [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn reads_notes_where_they_are_heard() {
+        // (difficulty, each note's heard beat less its written one, in the order of the notes)
+        let moved: [(ChartDifficulty, &[(usize, f64)]); 4] = [
+            (Easy, &[(5, 0.0), (5, 0.5)]),
+            (Medium, &[(9, 0.0)]),
+            (Hard, &[(5, 0.0), (4, 1.25)]),
+            (Challenge, &[(5, 0.0), (10, 0.5)]),
+        ];
+        let sim = load("beat_stats.sm");
+        for (difficulty, moved) in moved {
+            let chart = single(&sim, difficulty);
+            let notes = to_timed_notes(&chart.measures, &Timing::new(&chart.bpms, &chart.stops));
+            let shifts: Vec<f64> = notes.iter().map(|note| note.heard_beat - note.beat).collect();
+            let expected: Vec<f64> = moved.iter().flat_map(|&(notes, shift)| vec![shift; notes]).collect();
+            assert_eq!(shifts, expected, "{difficulty:?}");
+        }
+
+        // (difficulty, notes, off the beat, syncopations, notes on 4ths, 8ths and 16ths, finest)
+        let expected = [
+            (Beginner, 0, 0, 0, [0, 0, 0], 0),
+            (Easy, 10, 1, 1, [9, 1, 0], 8),
+            (Medium, 9, 0, 0, [9, 0, 0], 4),
+            (Hard, 9, 0, 0, [9, 0, 0], 4),
+            (Challenge, 15, 0, 0, [15, 0, 0], 4),
+        ];
+        for (difficulty, notes, off_beat, syncopations, on, finest) in expected {
+            let s = stats("beat_stats.sm", difficulty);
+            let feature = |name: &str| s.features().into_iter().find(|(feature, _)| feature == name).unwrap().1;
+            assert_eq!(feature("num_notes"), notes as f64, "{difficulty:?}");
+            assert_close(feature("offbeat_note_ratio") * notes as f64, off_beat as f64, &format!("{difficulty:?} notes off the beat"));
+            assert_eq!(s.technique(Technique::Syncopation).count, syncopations, "{difficulty:?} syncopations");
+            let counted = ["sub_div_4_notes", "sub_div_8_notes", "sub_div_16_notes"].map(|name| feature(name) as usize);
+            assert_eq!((counted, feature("finest_note_sub_div") as usize), (on, finest), "{difficulty:?}: (4ths, 8ths, 16ths), finest");
+        }
+        // Easy's syncopation: 0.25 s after the note before
+        assert_close(stats("beat_stats.sm", Easy).technique(Technique::Syncopation).max_speed, 4.0, "Easy syncopation");
+    }
+
     #[test]
     fn foots_arrow_letters() {
         let footed = foot_arrows("ld[U D]r", &COSTS, 1.0).unwrap();
@@ -701,7 +858,7 @@ mod tests {
             let (mut row, mut hold_ends) = ([Note::Empty; 4], [None; 4]);
             row[arrow] = if held_until.is_some() { Note::HoldStart } else { Note::Tap };
             hold_ends[arrow] = held_until;
-            TimedNote { time, beat: time, row, hold_ends }
+            TimedNote { time, beat: time, heard_beat: time, row, hold_ends }
         };
         let lengths = |notes: &[TimedNote]| -> Vec<usize> {
             segments(notes, SETTINGS.segment_break_seconds).iter().map(|segment| segment.len()).collect()
@@ -769,6 +926,23 @@ mod tests {
             let s = stats("pattern_stats.sm", difficulty);
             assert_speeds(&s, Technique::RepeatedArrow, repeats.0, repeats.1, difficulty);
             assert_speeds(&s, Technique::Jump, jumps.0, jumps.1, difficulty);
+        }
+    }
+
+    #[test]
+    fn finds_syncopations_and_rhythm_changes() {
+        // (difficulty, syncopations, rhythm changes), each (count, speeds: (mean, median, max))
+        let none = (0, (0.0, 0.0, 0.0));
+        let expected = [
+            (Beginner, none, none),
+            (Easy, (6, (17.0 / 6.0, 8.0 / 3.0, 4.0)), (10, (74.0 / 15.0, 4.0, 8.0))),
+            (Medium, none, (1, (4.0, 4.0, 4.0))),
+            (Hard, none, (5, (2.8, 2.0, 4.0))),
+        ];
+        for (difficulty, syncopations, changes) in expected {
+            let s = stats("rhythm_stats.sm", difficulty);
+            assert_speeds(&s, Technique::Syncopation, syncopations.0, syncopations.1, difficulty);
+            assert_speeds(&s, Technique::RhythmChange, changes.0, changes.1, difficulty);
         }
     }
 

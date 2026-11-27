@@ -1,20 +1,77 @@
 use burn::{
     module::{Param, ParamId},
-    nn::{Dropout, DropoutConfig, Linear, LinearConfig, Relu},
+    nn::{Dropout, DropoutConfig, Linear, LinearConfig},
     prelude::*,
+    tensor::activation,
 };
+use serde::{Deserialize, Serialize};
+
+/// What follows each hidden layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Activation {
+    #[default]
+    Relu,
+    Gelu,
+    Silu,
+    Mish,
+    Tanh,
+    /// With an alpha of 1
+    Elu,
+}
+
+impl Activation {
+    pub const ALL: [Activation; 6] =
+        [Activation::Relu, Activation::Gelu, Activation::Silu, Activation::Mish, Activation::Tanh, Activation::Elu];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Activation::Relu => "relu",
+            Activation::Gelu => "gelu",
+            Activation::Silu => "silu",
+            Activation::Mish => "mish",
+            Activation::Tanh => "tanh",
+            Activation::Elu => "elu",
+        }
+    }
+
+    fn forward<const D: usize>(self, x: Tensor<D>) -> Tensor<D> {
+        match self {
+            Activation::Relu => activation::relu(x),
+            Activation::Gelu => activation::gelu(x),
+            Activation::Silu => activation::silu(x),
+            Activation::Mish => activation::mish(x),
+            Activation::Tanh => activation::tanh(x),
+            Activation::Elu => activation::elu(x, 1.0),
+        }
+    }
+}
+
+impl std::str::FromStr for Activation {
+    type Err = String;
+
+    /// A `name`.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let named = Activation::ALL.into_iter().find(|activation| activation.name() == text);
+        named.ok_or_else(|| {
+            let names: Vec<&str> = Activation::ALL.iter().map(|activation| activation.name()).collect();
+            format!("{text:?} isn't an activation: {}", names.join(", "))
+        })
+    }
+}
 
 #[derive(Module, Debug)]
 pub struct Model {
     linears: Vec<Linear>,
-    activation: Relu,
+    #[module(skip)]
+    activation: Activation,
     dropout: Dropout,
     /// See `ModelConfig::input_clip`
     input_clip: f64,
 }
 
 /// A fully connected network, as the width of every layer from the inputs to the outputs. Each
-/// hidden layer is followed by a ReLU, then dropout while training. Inputs can be capped first.
+/// hidden layer is followed by its activation, then dropout while training. Inputs can be capped
+/// first.
 ///
 /// These are all 29 → 32 → 16 → 1:
 /// - `ModelConfig::new(vec![29, 32, 16, 1])`
@@ -33,6 +90,8 @@ pub struct ModelConfig {
     /// (A config saved before this existed has none: see `ModelConfig::read`.)
     #[config(default = 0.0)]
     pub input_clip: f64,
+    #[config(default = "Activation::Relu")]
+    pub activation: Activation,
 }
 
 impl ModelConfig {
@@ -70,11 +129,12 @@ impl ModelConfig {
     }
 
     /// A saved config. burn's `Config::load` needs every field, so one saved before `input_clip`
-    /// existed gets it here, as 0.
+    /// or `activation` existed gets it here, as 0 and a ReLU.
     pub fn read(path: impl AsRef<std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut fields: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
         if let Some(fields) = fields.as_object_mut() {
             fields.entry("input_clip").or_insert(0.0.into());
+            fields.entry("activation").or_insert("Relu".into());
         }
         Ok(serde_json::from_value(fields)?)
     }
@@ -104,7 +164,7 @@ impl ModelConfig {
         let linears = self.layer_sizes.windows(2).map(|pair| LinearConfig::new(pair[0], pair[1]).init(device)).collect();
         Model {
             linears,
-            activation: Relu::new(),
+            activation: self.activation,
             dropout: DropoutConfig::new(self.dropout).init(),
             input_clip: self.input_clip,
         }
@@ -232,7 +292,48 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let old = old.unwrap();
         assert_eq!((old.layer_sizes(), old.dropout, old.input_clip), (&[335, 2048, 1][..], 0.2, 0.0));
+        assert_eq!(old.activation, Activation::Relu);
         assert_eq!(saved.unwrap().input_clip, 5.0);
+    }
+
+    #[test]
+    fn applies_the_configured_activation() {
+        let device = DevicePreference::default().device();
+        let x = Tensor::<1>::from_data([-1.0, 0.0, 1.0], &device);
+        // (activation, its values at -1, 0 and 1)
+        let cases = [
+            (Activation::Relu, [0.0, 0.0, 1.0]),
+            (Activation::Gelu, [-0.158655, 0.0, 0.841345]),
+            (Activation::Silu, [-0.268941, 0.0, 0.731059]),
+            (Activation::Mish, [-0.303401, 0.0, 0.865098]),
+            (Activation::Tanh, [-0.761594, 0.0, 0.761594]),
+            (Activation::Elu, [-0.632121, 0.0, 1.0]),
+        ];
+        assert_eq!(cases.map(|(activation, _)| activation), Activation::ALL);
+        for (activation, expected) in cases {
+            let actual = activation.forward(x.clone()).into_data().try_to_vec::<f32>().unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-5, "{activation:?}: {actual}, not {expected}");
+            }
+            assert_eq!(activation.name().parse(), Ok(activation));
+        }
+        assert!("ReLU".parse::<Activation>().unwrap_err().contains("relu, gelu, silu, mish, tanh, elu"));
+
+        // One hidden layer, so the outputs are the last layer's of the activation's
+        let config = ModelConfig::new(vec![2, 3, 1]);
+        assert_eq!(config.activation, Activation::Relu, "a ReLU by default");
+        let model = config.with_activation(Activation::Tanh).init(&device).valid();
+        let inputs = Tensor::<2>::from_data([[0.5, -2.0], [3.0, 1.0]], &device);
+        let hidden = model.linears[0].forward(inputs.clone()).tanh();
+        let expected = model.linears[1].forward(hidden).into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(model.forward(inputs).into_data().try_to_vec::<f32>().unwrap(), expected);
+
+        // Saved with the config
+        let path = std::env::temp_dir().join(format!("ddr-trainer-activation-config-{}.json", std::process::id()));
+        ModelConfig::new(vec![3, 1]).with_activation(Activation::Gelu).save(&path).unwrap();
+        let saved = ModelConfig::read(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(saved.unwrap().activation, Activation::Gelu);
     }
 
     #[test]

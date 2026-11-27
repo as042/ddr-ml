@@ -25,12 +25,20 @@ tools:
                                train a rating model on a folder of song folders and save it, with
                                its split, in artifacts/<name>/ (replacing what's there), or by
                                default in a new artifacts/model_<UTC date>_<time>Z/
-  crossval [songs] [--folds <n>] [--name <name>]
+  crossval [songs] [--folds <n>] [--seed <n>] [--exclude <statistics>] [--activation <name>]
+           [--name <name>]
                                cross-validate train's model by song: each fold's charts are
                                predicted by a model trained without their songs (5 folds by
                                default), and scored against the official ratings and Sanbai's.
                                Every prediction is saved in artifacts/<name>/, or by default in
-                               a new artifacts/crossval_<UTC date>_<time>Z/
+                               a new artifacts/crossval_<UTC date>_<time>Z/, with what the run
+                               was. --seed trains with another seed (starting weights, batch
+                               order, dropout, input noise) on the same folds. --exclude leaves
+                               statistics out of the model's inputs, by name with commas
+                               between, * for any run of characters:
+                               --exclude 'syncopation_*,mode_bpm'
+                               --activation follows the hidden layer with relu, silu, mish,
+                               tanh or elu, where train has gelu
   pca [songs]                  fit a PCA of the chart statistics and save it
   infer [--model <name>] <simfile>...
                                rate each chart with the model saved in artifacts/<name>/, by

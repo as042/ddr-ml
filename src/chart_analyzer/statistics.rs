@@ -75,7 +75,8 @@ pub struct ChartStatistics {
     /// 1 over the least seconds from a jump to the next. 0 with fewer than two.
     pub(super) closest_jumps_speed: f64,
 
-    // Rhythms and timings. A measure's subdivision is the finest its notes need (see `row_sub_div`).
+    // Rhythms and timings. A note's subdivision is by where it's heard (`counts::note_sub_div`),
+    // a measure's the finest its notes need.
     /// Distinct subdivisions among the measures
     pub(super) num_sub_divs: usize,
     /// Most common subdivision (e.g. 8 = 8th notes). Ties go to the smaller.
@@ -95,6 +96,19 @@ pub struct ChartStatistics {
     pub(super) mean_note_sub_div: f64,
     /// Share of the notes on a non-power-of-2 subdivision
     pub(super) adv_sub_div_note_ratio: f64,
+    /// Share of the notes off the beat: on any subdivision but 4
+    pub(super) offbeat_note_ratio: f64,
+    /// Entropy, in bits, of the beats from each note to the next in its segment: 0 if they're
+    /// all the same, 1 for two as common as each other
+    pub(super) rhythm_entropy: f64,
+    // How many times smaller LZW makes the notes (see `compression`): more the more they
+    // repeat, under 1 with nothing to gain. Grows with the number of notes
+    /// Each note as its beats since the note before, then its arrows
+    pub(super) step_compression: f64,
+    /// The arrows alone
+    pub(super) arrow_compression: f64,
+    /// The beats alone
+    pub(super) rhythm_compression: f64,
     /// BPM with the most time between the first and last objects. Ties go to the smaller.
     pub(super) mode_bpm: f64,
     /// BPM changes strictly between the first and last objects, not counting changes to the
@@ -105,6 +119,20 @@ pub struct ChartStatistics {
     pub(super) max_bpm: f64,
     /// `max_bpm - min_bpm`
     pub(super) bpm_range: f64,
+    // Of the BPM each note is at
+    pub(super) mean_note_bpm: f64,
+    pub(super) median_note_bpm: f64,
+    pub(super) min_note_bpm: f64,
+    pub(super) max_note_bpm: f64,
+    /// Notes at a higher BPM than the note before
+    pub(super) num_note_speedups: usize,
+    /// Notes at a lower BPM than the note before
+    pub(super) num_note_slowdowns: usize,
+    // From each note's BPM to the next's, in octaves: 1 is twice the BPM, or half
+    /// Added up, both ways
+    pub(super) note_bpm_travel: f64,
+    pub(super) max_note_speedup: f64,
+    pub(super) max_note_slowdown: f64,
 
     // Stops from the first object's beat to before the last's
     pub(super) num_stops: usize,
@@ -113,6 +141,10 @@ pub struct ChartStatistics {
     pub(super) max_stop_seconds: f64,
     /// Fraction of `chart_dur` stopped
     pub(super) stop_ratio: f64,
+    // Stops in a run: between two notes `Settings::active_gap_seconds` apart at most, not
+    // counting the stops between them
+    pub(super) num_run_stops: usize,
+    pub(super) run_stop_seconds: f64,
 
     // DDR's groove radar, estimated (see `radar`)
     pub(super) radar_stream: f64,
@@ -231,16 +263,32 @@ impl ChartStatistics {
             ("finest_note_sub_div", self.finest_note_sub_div as f64),
             ("mean_note_sub_div", self.mean_note_sub_div),
             ("adv_sub_div_note_ratio", self.adv_sub_div_note_ratio),
+            ("offbeat_note_ratio", self.offbeat_note_ratio),
+            ("rhythm_entropy", self.rhythm_entropy),
+            ("step_compression", self.step_compression),
+            ("arrow_compression", self.arrow_compression),
+            ("rhythm_compression", self.rhythm_compression),
             ("mode_bpm", self.mode_bpm),
             ("num_bpm_changes", self.num_bpm_changes as f64),
             ("min_bpm", self.min_bpm),
             ("max_bpm", self.max_bpm),
             ("bpm_range", self.bpm_range),
+            ("mean_note_bpm", self.mean_note_bpm),
+            ("median_note_bpm", self.median_note_bpm),
+            ("min_note_bpm", self.min_note_bpm),
+            ("max_note_bpm", self.max_note_bpm),
+            ("num_note_speedups", self.num_note_speedups as f64),
+            ("num_note_slowdowns", self.num_note_slowdowns as f64),
+            ("note_bpm_travel", self.note_bpm_travel),
+            ("max_note_speedup", self.max_note_speedup),
+            ("max_note_slowdown", self.max_note_slowdown),
             ("num_stops", self.num_stops as f64),
             ("total_stop_seconds", self.total_stop_seconds),
             ("min_stop_seconds", self.min_stop_seconds),
             ("max_stop_seconds", self.max_stop_seconds),
             ("stop_ratio", self.stop_ratio),
+            ("num_run_stops", self.num_run_stops as f64),
+            ("run_stop_seconds", self.run_stop_seconds),
             ("radar_stream", self.radar_stream),
             ("radar_voltage", self.radar_voltage),
             ("radar_air", self.radar_air),

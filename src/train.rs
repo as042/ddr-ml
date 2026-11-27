@@ -522,6 +522,7 @@ impl Model {
 mod tests {
     use super::*;
     use crate::device::DevicePreference;
+    use crate::model::Activation;
 
     #[test]
     fn splits_rows_at_random() {
@@ -623,6 +624,23 @@ mod tests {
             assert_eq!(std.iter().all(|&std| std == 1.0), scaling != InputScaling::Standardize, "{scaling:?}: {std:?}");
             assert_eq!(mean.iter().all(|&mean| mean == 0.0), scaling == InputScaling::Unscaled, "{scaling:?}: {mean:?}");
             assert!(to_vec(trained.y_std.val())[0] > 1.0, "targets are always standardized");
+        }
+    }
+
+    #[test]
+    fn trains_through_every_activation() {
+        let device = DevicePreference::default().device();
+        let inputs: Vec<Vec<f32>> = (0..40).map(|i| vec![(i % 7) as f32 - 3.0, (i % 5) as f32 - 2.0]).collect();
+        let targets: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32]).collect();
+        let dataset = Dataset::from_rows(&inputs, &targets, &device);
+        let config = TrainingConfig::new().with_batch_size(8).with_max_epochs(2).with_input_scaling(InputScaling::Unscaled);
+        let outputs = |model: &Model| model.forward(dataset.x.clone().without_autodiff()).into_data().try_to_vec::<f32>().unwrap();
+        for activation in Activation::ALL {
+            let model = ModelConfig::new(vec![2, 4, 1]).with_activation(activation).init(&device);
+            let before = outputs(&model.valid());
+            let after = outputs(&model.fit(&dataset, &config).0.model);
+            assert!(after.iter().all(|output| output.is_finite()), "{activation:?}: {after:?}");
+            assert_ne!(after, before, "{activation:?}");
         }
     }
 

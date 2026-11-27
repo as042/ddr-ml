@@ -25,7 +25,7 @@ use crate::cma_es;
 use crate::cost_fit::{self, COLUMNS, SCORED, Sheet};
 use crate::dataset::{Dataset, scramble, shuffle};
 use crate::device::DevicePreference;
-use crate::model::ModelConfig;
+use crate::model::{Activation, ModelConfig};
 use crate::pca::Pca;
 use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart, simfiles_in};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
@@ -80,6 +80,8 @@ const SANBAI_FILE: &str = "data/sanbai/sanbai_sp_all.csv";
 const DEFAULT_FOLDS: usize = 5;
 /// In `crossval`'s folder: every chart's out-of-fold prediction.
 const PREDICTIONS_FILE: &str = "predictions.csv";
+/// In `crossval`'s folder (see `CrossvalRecord`).
+const CROSSVAL_FILE: &str = "crossval.json";
 /// `crossval` prints every 10th epoch of each fold.
 const CROSSVAL_LOG_INTERVAL: usize = 10;
 /// `train`'s (see `model_setup`).
@@ -273,7 +275,8 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// `train`'s model and training settings, which `crossval` uses too.
 fn model_setup(num_inputs: usize) -> (ModelConfig, TrainingConfig) {
-    let model_config = ModelConfig::funnel(num_inputs, 1, 2048, 1).with_dropout(0.2).with_input_clip(INPUT_CLIP);
+    let model_config =
+        ModelConfig::funnel(num_inputs, 1, 2048, 1).with_activation(Activation::Gelu).with_dropout(0.2).with_input_clip(INPUT_CLIP);
     let training = TrainingConfig::new()
         .with_batch_size(32)
         .with_input_noise(INPUT_NOISE)
@@ -284,20 +287,43 @@ fn model_setup(num_inputs: usize) -> (ModelConfig, TrainingConfig) {
 
 fn describe_model(model_config: &ModelConfig) -> String {
     format!(
-        "model: {} (inputs, hidden layers, output), dropout {}, weight decay {WEIGHT_DECAY}, input noise {INPUT_NOISE}, inputs capped at {} sd",
+        "model: {} (inputs, hidden layers, output), {} activation, dropout {}, weight decay {WEIGHT_DECAY}, input noise {INPUT_NOISE}, inputs capped at {} sd",
         model_config.shape(),
+        model_config.activation.name(),
         model_config.dropout,
         model_config.input_clip
     )
+}
+
+/// What a `crossval` run was, saved with its predictions.
+#[derive(Serialize)]
+struct CrossvalRecord {
+    folds: usize,
+    split_seed: u64,
+    train_seed: u64,
+    /// The statistics `--exclude` left out of the model's inputs
+    excluded: Vec<String>,
+    /// How many it took
+    statistics: usize,
+    /// `Activation::name`
+    activation: &'static str,
+    /// `analyzer_fingerprint` at the time
+    analyzer: u64,
 }
 
 /// Cross-validates `train`'s model on a folder of song folders (the argument, or the `DATASET`
 /// packs). The songs are dealt into `--folds` folds (`DEFAULT_FOLDS`), and each fold's charts are
 /// predicted by a model trained without its songs (`fold_split`). Prints how far the predictions
 /// are from the official ratings, and from Sanbai's (`SANBAI_FILE`) where it has the chart, and
-/// saves them all (`PREDICTIONS_FILE`) in `--name`'s folder in `ARTIFACTS`, or a new one.
+/// saves them all (`PREDICTIONS_FILE`), with what the run was (`CROSSVAL_FILE`), in `--name`'s
+/// folder in `ARTIFACTS`, or a new one.
+///
+/// `--seed` trains with another seed (`TrainingConfig::train_seed`) on the same folds.
+/// `--exclude` leaves statistics out of the model's inputs (`kept_columns`).
+/// `--activation` follows the hidden layer with another `Activation` than `model_setup`'s.
 pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let ([folds, name], songs) = take_options(args, ["--folds", "--name"])?;
+    let ([folds, seed, exclude, activation, name], songs) =
+        take_options(args, ["--folds", "--seed", "--exclude", "--activation", "--name"])?;
     let folds = match folds {
         None => DEFAULT_FOLDS,
         Some(folds) => {
@@ -305,22 +331,42 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
             parsed.ok_or_else(|| format!("--folds takes a whole number, 2 or more, not {folds}"))?
         }
     };
+    let seed = seed.map(|seed| seed.parse::<u64>().map_err(|_| format!("--seed takes a whole number, 0 or more, not {seed}")));
+    let seed = seed.transpose()?;
+    let activation = activation.map(|name| name.parse::<Activation>().map_err(|e| format!("--activation: {e}"))).transpose()?;
     // Before training, which takes minutes
     let named_dir = name.map(|name| model_dir(&name)).transpose()?;
+    let patterns: Vec<&str> = exclude.as_deref().map_or(Vec::new(), |list| list.split(',').map(str::trim).collect());
+    let (kept, excluded) = kept_columns(&statistic_names(), &patterns)?;
     let (_, samples) = cached_samples(&song_packs(&songs)?)?;
     let (song_of, num_songs) = song_ids(&samples);
     if num_songs < folds {
         return Err(format!("{num_songs} songs are too few for {folds} folds").into());
     }
 
-    let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
+    let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| kept.iter().map(|&column| sample.features[column]).collect()).collect();
     let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
     let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
-    let (model_config, training) = model_setup(inputs[0].len());
+    let (model_config, training) = model_setup(kept.len());
+    let model_config = match activation {
+        Some(activation) => model_config.with_activation(activation),
+        None => model_config,
+    };
     let training = training.with_log_interval(CROSSVAL_LOG_INTERVAL);
+    let training = match seed {
+        Some(seed) => training.with_train_seed(seed),
+        None => training,
+    };
     let fold_of_song = song_folds(num_songs, folds, training.split_seed);
     say!("{}", describe_model(&model_config));
-    say!("{num_songs} songs (a cover counts as the song it covers) in {folds} folds, split seed {}", training.split_seed);
+    if !excluded.is_empty() {
+        say!("{} statistics left out: {}", excluded.len(), excluded.join(", "));
+    }
+    say!(
+        "{num_songs} songs (a cover counts as the song it covers) in {folds} folds, split seed {}, train seed {}",
+        training.split_seed,
+        training.train_seed
+    );
 
     let mut predicted = vec![f64::NAN; samples.len()];
     for fold in 0..folds {
@@ -379,6 +425,16 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
         None => new_run_dir(Path::new(ARTIFACTS), "crossval", SystemTime::now())?,
     };
     fs::create_dir_all(&dir)?;
+    let record = CrossvalRecord {
+        folds,
+        split_seed: training.split_seed,
+        train_seed: training.train_seed,
+        excluded,
+        statistics: kept.len(),
+        activation: model_config.activation.name(),
+        analyzer: analyzer_fingerprint(),
+    };
+    fs::write(dir.join(CROSSVAL_FILE), serde_json::to_string_pretty(&record)?)?;
     let mut csv = String::from("chart,simfile,fold,rating,predicted,sanbai\n");
     for (row, sample) in samples.iter().enumerate() {
         let sanbai = sanbai_of.as_ref().and_then(|of| of[row]).map_or(String::new(), |rating| rating.to_string());
@@ -389,6 +445,44 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
     fs::write(dir.join(PREDICTIONS_FILE), csv)?;
     say!("\nsaved every chart's out-of-fold prediction to {}", dir.join(PREDICTIONS_FILE).display());
     Ok(())
+}
+
+/// The model's inputs by name: `ChartStatistics::features`', in order.
+fn statistic_names() -> Vec<String> {
+    ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect()
+}
+
+/// Whether `pattern` is `name`, with each `*` in it standing for any run of characters.
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(mut rest) = parts.next().and_then(|start| name.strip_prefix(start)) else { return false };
+    let parts: Vec<&str> = parts.collect();
+    // No `*`: the whole name
+    let Some((end, between)) = parts.split_last() else { return rest.is_empty() };
+    for part in between {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(end)
+}
+
+/// The columns of `names` that no pattern of `excluded` matches (`matches_pattern`), in order,
+/// and the names that one does. An error if a pattern matches none, or they leave no column.
+fn kept_columns(names: &[String], excluded: &[&str]) -> Result<(Vec<usize>, Vec<String>), String> {
+    if let Some(pattern) = excluded.iter().find(|pattern| !names.iter().any(|name| matches_pattern(pattern, name))) {
+        return Err(match pattern.is_empty() {
+            true => "--exclude takes statistics' names, with commas between".to_string(),
+            false => format!("no statistic is called {pattern} (`analyze` lists them)"),
+        });
+    }
+    let left_out = |name: &String| excluded.iter().any(|pattern| matches_pattern(pattern, name));
+    let (out, kept): (Vec<usize>, Vec<usize>) = (0..names.len()).partition(|&column| left_out(&names[column]));
+    match kept.is_empty() {
+        true => Err("--exclude leaves no statistics".to_string()),
+        false => Ok((kept, out.into_iter().map(|column| names[column].clone()).collect())),
+    }
 }
 
 /// Each sample's song, numbered from 0 in order of appearance, and how many songs. A song is
@@ -1983,6 +2077,54 @@ mod tests {
             all.sort();
             assert_eq!(all, (0..song_of.len()).collect::<Vec<_>>(), "every row once");
         }
+    }
+
+    #[test]
+    fn matches_statistic_names_with_wildcards() {
+        // (pattern, name, whether it matches)
+        let cases = [
+            ("jump_count", "jump_count", true),
+            ("jump_count", "jump_count_over_2", false),
+            ("jump_count", "a_jump_count", false),
+            ("jump_*", "jump_count_over_2", true),
+            ("jump_*", "jump_", true),
+            ("jump_*", "closest_jumps_speed", false),
+            ("*_compression", "step_compression", true),
+            ("*_compression", "step_compression_2", false),
+            ("*bpm*", "max_note_bpm", true),
+            ("*bpm*", "bpm_range", true),
+            ("num_*_per_second", "num_stops_per_second", true),
+            ("num_*_per_second", "num_stops_per_note", false),
+            // Each part after the one before
+            ("a*b*a", "aba", true),
+            ("a*b*a", "ab", false),
+            ("*", "anything", true),
+            ("", "anything", false),
+        ];
+        for (pattern, name, matches) in cases {
+            assert_eq!(matches_pattern(pattern, name), matches, "{pattern} against {name}");
+        }
+    }
+
+    #[test]
+    fn leaves_out_excluded_statistics() {
+        let names: Vec<String> = ["num_notes", "jump_count", "jump_per_note", "mode_bpm"].map(String::from).to_vec();
+        assert_eq!(kept_columns(&names, &[]), Ok((vec![0, 1, 2, 3], vec![])));
+        assert_eq!(kept_columns(&names, &["jump_*"]), Ok((vec![0, 3], vec!["jump_count".to_string(), "jump_per_note".to_string()])));
+        // In the statistics' order, a name once whatever matches it
+        let (kept, excluded) = kept_columns(&names, &["mode_bpm", "*_count", "jump_count"]).unwrap();
+        assert_eq!((kept, excluded), (vec![0, 2], vec!["jump_count".to_string(), "mode_bpm".to_string()]));
+        assert!(kept_columns(&names, &["jump_*", "jumps"]).unwrap_err().contains("no statistic is called jumps"));
+        assert!(kept_columns(&names, &["jump_*", ""]).unwrap_err().contains("with commas between"));
+        assert!(kept_columns(&names, &["*"]).unwrap_err().contains("leaves no statistics"));
+
+        // The real ones: every name once, a technique's 10 by its key
+        let names = statistic_names();
+        assert_eq!(names.len(), ChartStatistics::default().features().len());
+        let (kept, excluded) = kept_columns(&names, &["syncopation_*", "*_compression"]).unwrap();
+        assert_eq!((excluded.len(), kept.len()), (13, names.len() - 13));
+        assert!(excluded.iter().all(|name| name.starts_with("syncopation_") || name.ends_with("_compression")));
+        assert!(kept.is_sorted() && kept.iter().all(|&column| !excluded.contains(&names[column])));
     }
 
     #[test]
