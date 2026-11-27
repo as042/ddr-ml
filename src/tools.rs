@@ -30,6 +30,7 @@ use crate::pca::Pca;
 use crate::sim_loader::{ChartDifficulty, Note, SimFile, SingleChart, StepChart, simfiles_in};
 use crate::stats_cache::{StatsCache, analyzer_fingerprint};
 use crate::train::{self, Split, TrainedModel, TrainingConfig};
+use crate::trees::{TrainedTrees, TreesConfig};
 
 const CACHE_FILE: &str = "artifacts/stats_cache.json";
 /// Saved models are folders in here.
@@ -228,28 +229,79 @@ impl<'a> SplitRecord<'a> {
     }
 }
 
+/// What `train` and `crossval` fit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    /// `TreesConfig::default`
+    Trees,
+    /// `model_setup`'s
+    Network,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Trees => "trees",
+            Kind::Network => "network",
+        }
+    }
+
+    /// `--kind`'s value, or trees without one.
+    fn of(given: Option<String>) -> Result<Kind, String> {
+        match given.as_deref() {
+            None | Some("trees") => Ok(Kind::Trees),
+            Some("network") => Ok(Kind::Network),
+            Some(other) => Err(format!("--kind is trees or network, not {other}")),
+        }
+    }
+}
+
 /// Trains a model to predict DDR chart ratings from chart statistics, on every dance-single
 /// chart in a folder of song folders (the argument, or the `DATASET` packs), and saves it to
 /// `--name`'s folder in `ARTIFACTS`, or a new `new_run_dir`, with its split (`SPLIT_FILE`).
+/// The model is gradient-boosted trees, or `--kind network`'s neural network. Both take
+/// `model_setup`'s split, or `--train-ratio`'s (`with_train_ratio`).
 pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (name, songs) = take_option(args, "--name")?;
+    let ([name, kind, train_ratio], songs) = take_options(args, ["--name", "--kind", "--train-ratio"])?;
+    let kind = Kind::of(kind)?;
     // Before training, which takes minutes
     let named_dir = name.map(|name| model_dir(&name)).transpose()?;
     let (feature_names, samples) = cached_samples(&song_packs(&songs)?)?;
 
-    // Small batches: with only a few hundred charts, they make more steps per epoch.
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| sample.features.clone()).collect();
-    let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
-    let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
+    let targets: Vec<f32> = samples.iter().map(|sample| sample.rating + LEVEL_MIDDLE).collect();
     let (model_config, training) = model_setup(inputs[0].len());
-    enough_charts(samples.len(), &training, training.batch_size)?;
-    say!("{}", describe_model(&model_config));
-    let (trained, test) = model_config.train(&dataset, &training);
-    let dir = match named_dir {
-        Some(dir) => dir,
-        None => new_run_dir(Path::new(ARTIFACTS), "model", SystemTime::now())?,
+    let training = match train_ratio {
+        Some(ratio) => with_train_ratio(training, &ratio)?,
+        None => training,
     };
-    trained.save(&model_config, &dir)?;
+    enough_charts(samples.len(), &training, training.batch_size)?;
+    let run_dir = || match &named_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => new_run_dir(Path::new(ARTIFACTS), "model", SystemTime::now()),
+    };
+    // Saved in place of the other kind, which `infer` would otherwise still find
+    let (dir, test) = match kind {
+        Kind::Trees => {
+            let trees = TreesConfig::default();
+            say!("{}", trees.describe());
+            let (trained, test) = trees.train_on(&inputs, &targets, &train::split_rows(samples.len(), &training))?;
+            let dir = run_dir()?;
+            trained.save(&trees, &dir)?;
+            TrainedModel::remove_from(&dir)?;
+            (dir, test)
+        }
+        Kind::Network => {
+            let targets: Vec<Vec<f32>> = targets.iter().map(|&target| vec![target]).collect();
+            let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
+            say!("{}", describe_model(&model_config));
+            let (trained, test) = model_config.train(&dataset, &training);
+            let dir = run_dir()?;
+            trained.save(&model_config, &dir)?;
+            TrainedTrees::remove_from(&dir)?;
+            (dir, test)
+        }
+    };
     ModelInputs::now(feature_names).save(&dir)?;
     let split = SplitRecord::new(&samples, &training);
     // Recomputed, so checked against the split trained on
@@ -273,8 +325,10 @@ pub fn train(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `train`'s model and training settings, which `crossval` uses too.
+/// `train`'s network and training settings, which `crossval` uses too. The trees take its split
+/// and nothing else of it.
 fn model_setup(num_inputs: usize) -> (ModelConfig, TrainingConfig) {
+    // Small batches: with only a few hundred charts, they make more steps per epoch.
     let model_config =
         ModelConfig::funnel(num_inputs, 1, 2048, 1).with_activation(Activation::Gelu).with_dropout(0.2).with_input_clip(INPUT_CLIP);
     let training = TrainingConfig::new()
@@ -283,6 +337,16 @@ fn model_setup(num_inputs: usize) -> (ModelConfig, TrainingConfig) {
         .with_split_seed(SPLIT_SEED)
         .with_optimizer(AdamWConfig::new().with_weight_decay(WEIGHT_DECAY));
     (model_config, training)
+}
+
+/// `training` with `--train-ratio`'s share of the charts to train on, and the rest halved
+/// between validation and test.
+fn with_train_ratio(training: TrainingConfig, given: &str) -> Result<TrainingConfig, String> {
+    let ratio = given.parse::<f64>().ok().filter(|&ratio| ratio > 0.0 && ratio < 1.0);
+    let ratio = ratio.ok_or_else(|| format!("--train-ratio takes a share of the charts between 0 and 1, not {given}"))?;
+    // Rounded: half of 1 - 0.8 isn't quite 0.1
+    let valid_ratio = ((1.0 - ratio) / 2.0 * 1e6).round() / 1e6;
+    Ok(training.with_train_ratio(ratio).with_valid_ratio(valid_ratio))
 }
 
 fn describe_model(model_config: &ModelConfig) -> String {
@@ -305,8 +369,14 @@ struct CrossvalRecord {
     excluded: Vec<String>,
     /// How many it took
     statistics: usize,
-    /// `Activation::name`
-    activation: &'static str,
+    /// `Kind::name`
+    kind: &'static str,
+    /// The trees' settings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trees: Option<TreesConfig>,
+    /// The network's `Activation::name`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation: Option<&'static str>,
     /// `analyzer_fingerprint` at the time
     analyzer: u64,
 }
@@ -318,12 +388,14 @@ struct CrossvalRecord {
 /// saves them all (`PREDICTIONS_FILE`), with what the run was (`CROSSVAL_FILE`), in `--name`'s
 /// folder in `ARTIFACTS`, or a new one.
 ///
-/// `--seed` trains with another seed (`TrainingConfig::train_seed`) on the same folds.
-/// `--exclude` leaves statistics out of the model's inputs (`kept_columns`).
-/// `--activation` follows the hidden layer with another `Activation` than `model_setup`'s.
+/// `--seed` trains with another seed (`TreesConfig::seed`, `TrainingConfig::train_seed`) on the
+/// same folds. `--exclude` leaves statistics out of the model's inputs (`kept_columns`).
+/// `--kind network` cross-validates the network, and `--activation` follows its hidden layer
+/// with another `Activation` than `model_setup`'s.
 pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let ([folds, seed, exclude, activation, name], songs) =
-        take_options(args, ["--folds", "--seed", "--exclude", "--activation", "--name"])?;
+    let ([folds, seed, exclude, kind, activation, name], songs) =
+        take_options(args, ["--folds", "--seed", "--exclude", "--kind", "--activation", "--name"])?;
+    let kind = Kind::of(kind)?;
     let folds = match folds {
         None => DEFAULT_FOLDS,
         Some(folds) => {
@@ -334,6 +406,9 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
     let seed = seed.map(|seed| seed.parse::<u64>().map_err(|_| format!("--seed takes a whole number, 0 or more, not {seed}")));
     let seed = seed.transpose()?;
     let activation = activation.map(|name| name.parse::<Activation>().map_err(|e| format!("--activation: {e}"))).transpose()?;
+    if kind == Kind::Trees && activation.is_some() {
+        return Err("--activation is the network's: give --kind network with it".into());
+    }
     // Before training, which takes minutes
     let named_dir = name.map(|name| model_dir(&name)).transpose()?;
     let patterns: Vec<&str> = exclude.as_deref().map_or(Vec::new(), |list| list.split(',').map(str::trim).collect());
@@ -345,27 +420,36 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let inputs: Vec<Vec<f32>> = samples.iter().map(|sample| kept.iter().map(|&column| sample.features[column]).collect()).collect();
-    let targets: Vec<Vec<f32>> = samples.iter().map(|sample| vec![sample.rating + LEVEL_MIDDLE]).collect();
-    let dataset = Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device());
+    let targets: Vec<f32> = samples.iter().map(|sample| sample.rating + LEVEL_MIDDLE).collect();
     let (model_config, training) = model_setup(kept.len());
     let model_config = match activation {
         Some(activation) => model_config.with_activation(activation),
         None => model_config,
     };
     let training = training.with_log_interval(CROSSVAL_LOG_INTERVAL);
-    let training = match seed {
-        Some(seed) => training.with_train_seed(seed),
-        None => training,
+    let (training, trees) = match seed {
+        Some(seed) => (training.with_train_seed(seed), TreesConfig::default().with_seed(seed)),
+        None => (training, TreesConfig::default()),
+    };
+    let network_data = (kind == Kind::Network).then(|| {
+        let targets: Vec<Vec<f32>> = targets.iter().map(|&target| vec![target]).collect();
+        Dataset::from_rows(&inputs, &targets, &DevicePreference::default().device())
+    });
+    let train_seed = match kind {
+        Kind::Trees => trees.seed,
+        Kind::Network => training.train_seed,
     };
     let fold_of_song = song_folds(num_songs, folds, training.split_seed);
-    say!("{}", describe_model(&model_config));
+    say!("{}", match kind {
+        Kind::Trees => trees.describe(),
+        Kind::Network => describe_model(&model_config),
+    });
     if !excluded.is_empty() {
         say!("{} statistics left out: {}", excluded.len(), excluded.join(", "));
     }
     say!(
-        "{num_songs} songs (a cover counts as the song it covers) in {folds} folds, split seed {}, train seed {}",
-        training.split_seed,
-        training.train_seed
+        "{num_songs} songs (a cover counts as the song it covers) in {folds} folds, split seed {}, train seed {train_seed}",
+        training.split_seed
     );
 
     let mut predicted = vec![f64::NAN; samples.len()];
@@ -376,7 +460,10 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         let test_songs = fold_of_song.iter().filter(|&&of| of == fold).count();
         say!("\n== fold {} of {folds}: {test_songs} songs held out", fold + 1);
-        let (_, test) = model_config.train_on(&dataset, &training, split);
+        let test = match &network_data {
+            Some(dataset) => model_config.train_on(dataset, &training, split).1,
+            None => trees.train_on(&inputs, &targets, &split)?.1,
+        };
         for (&row, prediction) in test.rows.iter().zip(&test.predictions) {
             predicted[row] = prediction[0] as f64;
         }
@@ -428,10 +515,12 @@ pub fn crossval(args: &[String]) -> Result<(), Box<dyn Error>> {
     let record = CrossvalRecord {
         folds,
         split_seed: training.split_seed,
-        train_seed: training.train_seed,
+        train_seed,
         excluded,
         statistics: kept.len(),
-        activation: model_config.activation.name(),
+        kind: kind.name(),
+        trees: (kind == Kind::Trees).then_some(trees),
+        activation: (kind == Kind::Network).then(|| model_config.activation.name()),
         analyzer: analyzer_fingerprint(),
     };
     fs::write(dir.join(CROSSVAL_FILE), serde_json::to_string_pretty(&record)?)?;
@@ -728,7 +817,8 @@ pub fn pca(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 /// Rates every dance-single chart of each simfile with `--model`'s model in `ARTIFACTS`, or
-/// `DEFAULT_MODEL`. Refuses if the model was trained on other statistics than charts have now.
+/// `DEFAULT_MODEL`: its trees if it holds any, or else its network. Refuses if the model was
+/// trained on other statistics than charts have now.
 pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (name, simfiles) = take_option(args, "--model")?;
     if simfiles.is_empty() {
@@ -736,20 +826,32 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let dir = model_dir(name.as_deref().unwrap_or(DEFAULT_MODEL))?;
     let shown = dir.display();
-    let device = DevicePreference::default().device();
-    let model = TrainedModel::load(&dir, &device)
-        .map_err(|e| format!("couldn't load the model in {shown} ({e}): has `train` saved one there?"))?;
+    let load_error = |e: Box<dyn Error>| format!("couldn't load the model in {shown} ({e}): has `train` saved one there?");
+    type Predict = Box<dyn Fn(Vec<f32>) -> Result<f32, Box<dyn Error>>>;
+    let (num_inputs, predict): (usize, Predict) = if TrainedTrees::saved_in(&dir) {
+        let trees = TrainedTrees::load(&dir).map_err(load_error)?;
+        (trees.num_inputs(), Box::new(move |features| Ok(trees.predict(&[features])?[0])))
+    } else {
+        let device = DevicePreference::default().device();
+        let model = TrainedModel::load(&dir, &device).map_err(load_error)?;
+        let num_inputs = model.model.num_inputs();
+        let predict = move |features: Vec<f32>| -> Result<f32, Box<dyn Error>> {
+            let width = features.len();
+            let x = Tensor::<2>::from_data(TensorData::new(features, [1, width]), &device);
+            Ok(model.predict(x).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?[0])
+        };
+        (num_inputs, Box::new(predict))
+    };
     let trained_on = ModelInputs::load(&dir)
         .map_err(|e| format!("the model in {shown} doesn't say which statistics it takes ({e}): train it again"))?;
     let names = ChartStatistics::default().features().into_iter().map(|(name, _)| name).collect();
     if let Some(warning) = trained_on.check(&ModelInputs::now(names))? {
         eprintln!("warning: {warning}");
     }
-    // A mismatch would broadcast silently
-    if trained_on.features.len() != model.model.num_inputs() {
+    // A network's mismatch would broadcast silently
+    if trained_on.features.len() != num_inputs {
         return Err(format!(
-            "the model in {shown} takes {} statistics, but {INPUTS_FILE} lists {}: train it again",
-            model.model.num_inputs(),
+            "the model in {shown} takes {num_inputs} statistics, but {INPUTS_FILE} lists {}: train it again",
             trained_on.features.len()
         )
         .into());
@@ -768,10 +870,7 @@ pub fn infer(args: &[String]) -> Result<(), Box<dyn Error>> {
                     continue;
                 }
             };
-            let width = features.len();
-            let x = Tensor::<2>::from_data(TensorData::new(features, [1, width]), &device);
-            let predicted = model.predict(x).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            say!("{name:<10} {:>6} {:>9.2}", chart.rating, predicted[0]);
+            say!("{name:<10} {:>6} {:>9.2}", chart.rating, predict(features)?);
         }
         say!();
     }
@@ -2054,6 +2153,28 @@ mod tests {
             sample("other/Song C/Song C.sm", ChartDifficulty::Hard, 9.0),
         ];
         assert_eq!(song_ids(&samples), (vec![0, 1, 0, 1, 2], 3));
+    }
+
+    #[test]
+    fn train_ratio_halves_the_rest() {
+        let ratios = |given: &str| with_train_ratio(TrainingConfig::new(), given).map(|training| (training.train_ratio, training.valid_ratio));
+        assert_eq!(ratios("0.8"), Ok((0.8, 0.1)));
+        assert_eq!(ratios("0.5"), Ok((0.5, 0.25)));
+        let (train, validation, test) = train::split_rows(1000, &with_train_ratio(TrainingConfig::new(), "0.8").unwrap());
+        assert_eq!((train.len(), validation.len(), test.len()), (800, 100, 100));
+        for given in ["0", "1", "1.5", "-0.2", "80%", ""] {
+            assert_eq!(ratios(given), Err(format!("--train-ratio takes a share of the charts between 0 and 1, not {given}")));
+        }
+    }
+
+    #[test]
+    fn kind_is_trees_unless_told() {
+        let kind = |given: Option<&str>| Kind::of(given.map(String::from));
+        assert_eq!(kind(None), Ok(Kind::Trees));
+        assert_eq!(kind(Some("trees")), Ok(Kind::Trees));
+        assert_eq!(kind(Some("network")), Ok(Kind::Network));
+        assert_eq!(kind(Some("Network")), Err("--kind is trees or network, not Network".into()));
+        assert_eq!((Kind::Trees.name(), Kind::Network.name()), ("trees", "network"));
     }
 
     #[test]

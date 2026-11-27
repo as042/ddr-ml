@@ -248,6 +248,17 @@ impl TrainedModel {
         Ok(())
     }
 
+    /// Deletes what [`TrainedModel::save`] wrote into `dir`, if anything.
+    pub fn remove_from(dir: impl AsRef<Path>) -> std::io::Result<()> {
+        for file in [CONFIG_FILE, WEIGHTS_FILE] {
+            match std::fs::remove_file(dir.as_ref().join(file)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Loads a model saved with [`TrainedModel::save`], in validation mode.
     pub fn load(dir: impl AsRef<Path>, device: &Device) -> Result<Self, Box<dyn Error>> {
         let dir = dir.as_ref();

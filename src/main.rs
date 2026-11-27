@@ -5,6 +5,7 @@ mod device;
 mod model;
 mod pca;
 mod train;
+mod trees;
 mod sim_loader;
 mod chart_analyzer;
 mod cma_es;
@@ -21,28 +22,34 @@ const USAGE: &str = "\
 usage: ddr-trainer <tool> [arguments]
 
 tools:
-  train [songs] [--name <name>]
+  train [songs] [--name <name>] [--kind <kind>] [--train-ratio <share>]
                                train a rating model on a folder of song folders and save it, with
                                its split, in artifacts/<name>/ (replacing what's there), or by
-                               default in a new artifacts/model_<UTC date>_<time>Z/
-  crossval [songs] [--folds <n>] [--seed <n>] [--exclude <statistics>] [--activation <name>]
-           [--name <name>]
+                               default in a new artifacts/model_<UTC date>_<time>Z/. The model is
+                               gradient-boosted trees, or with --kind network a neural network.
+                               It trains on 0.7 of the charts, or --train-ratio's share, and
+                               the rest are halved: one half decides when training stops, the
+                               other tests the model
+  crossval [songs] [--folds <n>] [--seed <n>] [--exclude <statistics>] [--kind <kind>]
+           [--activation <name>] [--name <name>]
                                cross-validate train's model by song: each fold's charts are
                                predicted by a model trained without their songs (5 folds by
                                default), and scored against the official ratings and Sanbai's.
                                Every prediction is saved in artifacts/<name>/, or by default in
                                a new artifacts/crossval_<UTC date>_<time>Z/, with what the run
-                               was. --seed trains with another seed (starting weights, batch
-                               order, dropout, input noise) on the same folds. --exclude leaves
+                               was. --seed trains with another seed (the charts and statistics
+                               each tree sees, or a network's starting weights, batch order,
+                               dropout and input noise) on the same folds. --exclude leaves
                                statistics out of the model's inputs, by name with commas
                                between, * for any run of characters:
                                --exclude 'syncopation_*,mode_bpm'
-                               --activation follows the hidden layer with relu, silu, mish,
+                               --kind network cross-validates the neural network, and
+                               --activation follows its hidden layer with relu, silu, mish,
                                tanh or elu, where train has gelu
   pca [songs]                  fit a PCA of the chart statistics and save it
   infer [--model <name>] <simfile>...
-                               rate each chart with the model saved in artifacts/<name>/, by
-                               default artifacts/a3_model3/
+                               rate each chart with the model saved in artifacts/<name>/, of
+                               either kind, by default artifacts/a3_model3/
   feet <arrows> [speed]        foot one segment, e.g. UDDRLRURDL (a jump in brackets: L[UD]R;
                                a hold from D+ to D-, or to the end: D+RUD-L; a space is a
                                pause of one row: \"LR  UD\"). A row is a 16th at 120 BPM, or
